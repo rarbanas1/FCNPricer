@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Callable worst-of FCN pricer with Yahoo Finance inputs.")
+st.caption("Term-sheet-based FCN / autocallable pricer using Yahoo Finance inputs.")
 
 TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
 
@@ -30,7 +30,7 @@ def get_iv_proxy(ticker: str) -> float:
         expiries = []
     for exp in expiries[:2]:
         try:
-            chain = t.option_chain(exp).puts
+            chain = t.option_chain(exp).calls
             if not chain.empty and "impliedVolatility" in chain.columns:
                 iv = float(chain["impliedVolatility"].dropna().median())
                 if 0 < iv < 5:
@@ -80,38 +80,90 @@ def hist_corr(tickers):
     return pd.DataFrame(corr_values, index=tickers, columns=tickers)
 
 
-def price_note(spots, vols, divs, corr, obs_months, maturity, funding, knock_in, call_coupon, notional, n_paths=50000, seed=7):
+def yearfrac(a, b):
+    return max((pd.to_datetime(a) - pd.to_datetime(b)).days / 365.0, 0.0)
+
+
+def simulate_joint_paths(spots, vols, divs, corr, dates, valuation_date, funding, n_paths=50000, seed=7):
     spots = np.asarray(spots, dtype=float)
     vols = np.asarray(vols, dtype=float)
     divs = np.asarray(divs, dtype=float)
     n = len(spots)
     L = np.linalg.cholesky(corr)
-    obs_years = sorted([m / 12.0 for m in obs_months if 0 < m <= maturity * 12 + 1e-12])
     rng = np.random.default_rng(seed)
-
-    call_pv = 0.0
-    call_prob = 0.0
-    survival_prob = 1.0
-
-    for t in obs_years:
+    times = [yearfrac(d, valuation_date) for d in dates]
+    out = []
+    for t in times:
+        if t <= 0:
+            continue
         z = rng.standard_normal((n_paths, n)) @ L.T
-        terminal = spots * np.exp((funding - divs - 0.5 * vols**2) * t + vols * np.sqrt(t) * z)
-        worst_ratio = (terminal / spots).min(axis=1)
-        call_now = (worst_ratio >= 1.0)
-        p_call = float(call_now.mean())
-        call_pv += np.exp(-funding * t) * (1.0 + call_coupon) * survival_prob * p_call
-        call_prob += survival_prob * p_call
-        survival_prob *= (1.0 - p_call)
+        st_t = spots * np.exp((funding - divs - 0.5 * vols**2) * t + vols * np.sqrt(t) * z)
+        out.append((t, st_t))
+    return out
 
-    z = rng.standard_normal((n_paths, n)) @ L.T
-    terminal = spots * np.exp((funding - divs - 0.5 * vols**2) * maturity + vols * np.sqrt(maturity) * z)
-    worst_ratio = (terminal / spots).min(axis=1)
-    maturity_payoff = np.where(worst_ratio >= 1.0, 1.0, np.where(worst_ratio >= knock_in, 1.0, worst_ratio))
-    maturity_pv = np.exp(-funding * maturity) * maturity_payoff.mean() * survival_prob
 
-    pv = float(call_pv + maturity_pv)
-    expected_call_time = float(np.mean(obs_years)) if obs_years else maturity
-    return pv, float(call_prob), expected_call_time
+def price_fcn(spots, vols, divs, corr, valuation_date, maturity_date, call_dates, coupon_dates, funding, coupon_rate, knock_in, call_barrier, notional, participation=1.0, coupon_memory=False, n_paths=50000, seed=7):
+    spots = np.asarray(spots, dtype=float)
+    vols = np.asarray(vols, dtype=float)
+    divs = np.asarray(divs, dtype=float)
+    n = len(spots)
+    L = np.linalg.cholesky(corr)
+    rng = np.random.default_rng(seed)
+    val_dt = pd.to_datetime(valuation_date)
+    mat_dt = pd.to_datetime(maturity_date)
+    call_dates = sorted([pd.to_datetime(d) for d in call_dates if pd.to_datetime(d) > val_dt and pd.to_datetime(d) <= mat_dt])
+    coupon_dates = sorted([pd.to_datetime(d) for d in coupon_dates if pd.to_datetime(d) > val_dt and pd.to_datetime(d) <= mat_dt])
+    call_times = [yearfrac(d, val_dt) for d in call_dates]
+    coupon_times = [yearfrac(d, val_dt) for d in coupon_dates]
+    maturity_t = yearfrac(mat_dt, val_dt)
+
+    alive = np.ones(n_paths, dtype=bool)
+    accrued_coupon = np.zeros(n_paths, dtype=float)
+    pv = np.zeros(n_paths, dtype=float)
+    called = np.zeros(n_paths, dtype=bool)
+    call_time = np.full(n_paths, maturity_t, dtype=float)
+
+    schedule = sorted(set([(d, "call") for d in call_dates] + [(d, "coupon") for d in coupon_dates] + [(mat_dt, "maturity")]))
+    prev_t = 0.0
+    for d, typ in schedule:
+        t = yearfrac(d, val_dt)
+        if t <= prev_t:
+            continue
+        z = rng.standard_normal((n_paths, n)) @ L.T
+        st_t = spots * np.exp((funding - divs - 0.5 * vols**2) * t + vols * np.sqrt(t) * z)
+        worst_ratio = (st_t / spots).min(axis=1)
+
+        if typ == "coupon":
+            coupon_hit = alive & (worst_ratio >= knock_in)
+            if coupon_memory:
+                accrued_coupon[coupon_hit] += coupon_rate
+            else:
+                pv[coupon_hit] += np.exp(-funding * t) * coupon_rate
+
+        if typ == "call":
+            call_hit = alive & (worst_ratio >= call_barrier)
+            if call_hit.any():
+                pv[call_hit] += np.exp(-funding * t) * (1.0 + coupon_rate + (accrued_coupon[call_hit] if coupon_memory else 0.0))
+                alive[call_hit] = False
+                called[call_hit] = True
+                call_time[call_hit] = t
+
+        if typ == "maturity":
+            survive = alive
+            final_ratio = worst_ratio
+            ki_hit = final_ratio < knock_in
+            redemption = np.where(ki_hit, np.maximum(0.0, participation * final_ratio), 1.0)
+            payoff = redemption + (accrued_coupon if coupon_memory else 0.0)
+            pv[survive] += np.exp(-funding * t) * payoff[survive]
+            alive[:] = False
+
+        prev_t = t
+
+    note_pv = float(pv.mean())
+    embedded_option_value = max(1.0 - note_pv, 0.0)
+    call_probability = float(called.mean())
+    expected_call_time = float(call_time[called].mean()) if called.any() else maturity_t
+    return note_pv, embedded_option_value, call_probability, expected_call_time
 
 
 def load_template(path: Path):
@@ -133,19 +185,30 @@ with st.sidebar:
     elif use_template and TEMPLATE.exists():
         vals = load_template(TEMPLATE)
 
-n_under = st.sidebar.slider("Number of underlyings", 1, 4, 3)
-maturity = st.sidebar.number_input("Maturity (years)", 0.25, 5.0, float(vals.get("Maturity (years)", 1.0)), 0.25)
-funding = st.sidebar.number_input("Funding rate", 0.0, 0.25, float(vals.get("Funding rate", 0.0375)), 0.0025, format="%.4f")
-knock_in = st.sidebar.number_input("Knock-in level %", 0.05, 1.0, float(vals.get("Knock-in %", 0.5)), 0.05, format="%.2f")
-call_coupon = st.sidebar.number_input("Call coupon %", 0.0, 1.0, float(vals.get("Call coupon %", 0.0)), 0.01, format="%.2f")
-notional = st.sidebar.number_input("Notional", 1000.0, 10000000.0, float(vals.get("Notional", 100000.0)), 1000.0)
-auto_pull = st.sidebar.checkbox("Auto-pull Yahoo Finance data", True)
-use_corr = st.sidebar.checkbox("Use historical correlation", True)
-obs_count = st.sidebar.slider("Number of observation dates", 0, 3, 1)
-obs_months = []
-for i in range(obs_count):
-    default_months = [3, 6, 9][i]
-    obs_months.append(st.sidebar.number_input(f"Observation date {i+1} (months)", 1, max(1, int(maturity * 12)), default_months, 1))
+    valuation_date = st.date_input("Valuation date", value=pd.to_datetime(vals.get("Valuation date", pd.Timestamp.today())).date())
+    maturity_date = st.date_input("Maturity date", value=pd.to_datetime(vals.get("Maturity date", pd.Timestamp.today() + pd.DateOffset(years=1))).date())
+    n_under = st.slider("Number of underlyings", 1, 4, 3)
+    funding = st.number_input("Funding rate", 0.0, 0.25, float(vals.get("Funding rate", 0.0375)), 0.0025, format="%.4f")
+    knock_in = st.number_input("Knock-in barrier %", 0.05, 1.0, float(vals.get("Knock-in barrier %", 0.5)), 0.05, format="%.2f")
+    call_barrier = st.number_input("Call barrier %", 0.05, 1.5, float(vals.get("Call barrier %", 1.0)), 0.05, format="%.2f")
+    coupon_rate = st.number_input("Coupon rate % per period", 0.0, 1.0, float(vals.get("Coupon rate %", 0.10)), 0.01, format="%.2f")
+    participation = st.number_input("Downside participation", 0.0, 2.0, float(vals.get("Participation", 1.0)), 0.05, format="%.2f")
+    coupon_memory = st.checkbox("Coupon memory", value=bool(vals.get("Coupon memory", False)))
+    notional = st.number_input("Notional", 1000.0, 10000000.0, float(vals.get("Notional", 100000.0)), 1000.0)
+    auto_pull = st.checkbox("Auto-pull Yahoo Finance data", True)
+    use_corr = st.checkbox("Use historical correlation", True)
+    call_count = st.slider("Number of call observation dates", 0, 3, 1)
+    coupon_count = st.slider("Number of coupon dates", 0, 12, 4)
+
+    st.subheader("Schedule")
+    call_dates = []
+    for i in range(call_count):
+        default_date = (pd.to_datetime(valuation_date) + pd.DateOffset(months=[6, 12, 18][i])).date()
+        call_dates.append(st.date_input(f"Call date {i+1}", value=default_date, key=f"call_date_{i}"))
+    coupon_dates = []
+    for i in range(coupon_count):
+        default_date = (pd.to_datetime(valuation_date) + pd.DateOffset(months=3 * (i + 1))).date()
+        coupon_dates.append(st.date_input(f"Coupon date {i+1}", value=default_date, key=f"coupon_date_{i}"))
 
 base_defaults = [str(vals.get(f"Underlying {i}", "")) for i in range(1, 5)]
 base_defaults = [b if b else d for b, d in zip(base_defaults, ["SOXX", "DRAM", "FXI", "AAPL"])]
@@ -184,18 +247,31 @@ if st.button("Price FCN"):
     divs = [r[3] for r in rows]
     corr = hist_corr(tickers) if use_corr and len(tickers) > 1 else pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     try:
-        pv, call_prob, exp_call_time = price_note(spots, vols, divs, corr.values, obs_months, maturity, funding, knock_in, call_coupon, notional)
-        option_cost = pv * notional
+        note_pv, opt_val, call_prob, exp_call_time = price_fcn(
+            spots, vols, divs, corr.values,
+            valuation_date, maturity_date, call_dates, coupon_dates,
+            funding, coupon_rate, knock_in, call_barrier, participation,
+            coupon_memory=coupon_memory
+        )
+        note_cost = note_pv * notional
+        option_cost = opt_val * notional
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Embedded option value", f"{pv:.4%}")
-        c2.metric("Option cost ($)", f"${option_cost:,.2f}")
-        c3.metric("Call probability", f"{call_prob:.2%}")
-        c4.metric("Expected call time", f"{exp_call_time:.2f}y")
+        c1.metric("Note PV", f"{note_pv:.4%}")
+        c2.metric("Embedded option value", f"{opt_val:.4%}")
+        c3.metric("Note cost ($)", f"${note_cost:,.2f}")
+        c4.metric("Option cost ($)", f"${option_cost:,.2f}")
+
         st.divider()
         inp = pd.DataFrame(rows, columns=["Ticker", "Spot", "Vol", "Dividend Yield"])
-        inp["Knock-in strike"] = inp["Spot"] * knock_in
+        inp["Protection strike"] = inp["Spot"] * knock_in
+        inp["Call strike"] = inp["Spot"] * call_barrier
         st.dataframe(inp, use_container_width=True, hide_index=True)
-        st.subheader("Observation dates")
-        st.write(obs_months if obs_months else ["None"])
+
+        st.subheader("Schedule")
+        sch = pd.DataFrame({
+            "Type": ["Valuation", "Maturity"] + ["Call"] * len(call_dates) + ["Coupon"] * len(coupon_dates),
+            "Date": [str(valuation_date), str(maturity_date)] + [str(d) for d in call_dates] + [str(d) for d in coupon_dates]
+        })
+        st.dataframe(sch, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(str(e))
