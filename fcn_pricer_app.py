@@ -67,8 +67,10 @@ def hist_corr(tickers):
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
     corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
-    np.fill_diagonal(corr.values, 1.0)
-    return corr
+    corr = corr.to_numpy()
+    if corr.size:
+        np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=tickers, columns=tickers)
 
 
 def mc_worst_of(spots, vols, divs, corr, barrier, maturity, funding, n_paths=30000, seed=7):
