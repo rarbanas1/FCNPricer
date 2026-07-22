@@ -1,4 +1,3 @@
-
 import math
 from pathlib import Path
 
@@ -67,10 +66,13 @@ def hist_corr(tickers):
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
     corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
-    corr = corr.to_numpy()
-    if corr.size:
-        np.fill_diagonal(corr, 1.0)
-    return pd.DataFrame(corr, index=tickers, columns=tickers)
+    arr = np.asarray(corr, dtype=float)
+    if arr.ndim == 2 and arr.shape[0] == arr.shape[1] and arr.size > 0:
+        for i in range(min(arr.shape[0], arr.shape[1])):
+            arr[i, i] = 1.0
+    else:
+        arr = np.eye(len(tickers), dtype=float)
+    return pd.DataFrame(arr, index=tickers, columns=tickers)
 
 
 def mc_worst_of(spots, vols, divs, corr, barrier, maturity, funding, n_paths=30000, seed=7):
