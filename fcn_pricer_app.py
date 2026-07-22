@@ -1,3 +1,4 @@
+
 import math
 from pathlib import Path
 
@@ -61,18 +62,22 @@ def hist_corr(tickers):
             frames.append(s)
         except Exception:
             pass
+    if len(frames) < 2:
+        return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     df = pd.concat(frames, axis=1).dropna()
     if df.shape[1] < 2 or df.empty:
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
-    corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
-    arr = np.asarray(corr, dtype=float)
-    if arr.ndim == 2 and arr.shape[0] == arr.shape[1] and arr.size > 0:
-        for i in range(min(arr.shape[0], arr.shape[1])):
-            arr[i, i] = 1.0
+    corr_df = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
+    corr_df = corr_df.clip(-1.0, 1.0)
+    corr_values = corr_df.values.astype(float, copy=True)
+    if corr_values.shape[0] == corr_values.shape[1] and corr_values.size > 0:
+        corr_values = (corr_values + corr_values.T) / 2.0
+        for i in range(corr_values.shape[0]):
+            corr_values[i, i] = 1.0
     else:
-        arr = np.eye(len(tickers), dtype=float)
-    return pd.DataFrame(arr, index=tickers, columns=tickers)
+        corr_values = np.eye(len(tickers), dtype=float)
+    return pd.DataFrame(corr_values, index=tickers, columns=tickers)
 
 
 def mc_worst_of(spots, vols, divs, corr, barrier, maturity, funding, n_paths=30000, seed=7):
