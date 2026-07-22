@@ -226,6 +226,3 @@ if st.button("Price FCN"):
         st.write(obs_months if obs_months else ["None"])
     except Exception as e:
         st.error(str(e))
-t/csv")
-    except Exception as e:
-        st.error(str(e))
