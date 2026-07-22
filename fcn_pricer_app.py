@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Worst-of FCN pricer using Yahoo Finance data and correlated Monte Carlo.")
+st.caption("Schedule-driven worst-of FCN pricer.")
 
 TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
 
@@ -80,24 +80,66 @@ def hist_corr(tickers):
     return pd.DataFrame(corr_values, index=tickers, columns=tickers)
 
 
-def mc_worst_of(spots, vols, divs, corr, barrier, maturity, funding, n_paths=30000, seed=7):
+def simulate_paths(spots, vols, divs, corr, obs_years, maturity, funding, n_paths=30000, seed=7):
     rng = np.random.default_rng(seed)
+    spots = np.asarray(spots, dtype=float)
+    vols = np.asarray(vols, dtype=float)
+    divs = np.asarray(divs, dtype=float)
     n = len(spots)
     L = np.linalg.cholesky(corr)
+    obs_years = sorted([t for t in obs_years if 0 < t <= maturity + 1e-12])
+    if not obs_years:
+        obs_years = [maturity]
+    z_prev = np.zeros((n_paths, n), dtype=float)
+    path_alive = np.ones(n_paths, dtype=bool)
+    call_time = np.full(n_paths, maturity, dtype=float)
+    call_idx = np.full(n_paths, -1, dtype=int)
+    call_mask_at = []
+    last_t = 0.0
+    for j, t in enumerate(obs_years):
+        dt = t - last_t
+        if dt <= 0:
+            continue
+        z_step = rng.standard_normal((n_paths, n)) @ L.T
+        z_prev = z_step
+        drift = (funding - divs - 0.5 * vols**2) * t
+        shock = vols * np.sqrt(t) * z_prev
+        terminal = spots * np.exp(drift + shock)
+        worst_ratio = (terminal / spots).min(axis=1)
+        call_now = path_alive & (worst_ratio >= 1.0)
+        call_mask_at.append(call_now)
+        if call_now.any():
+            call_time[call_now] = t
+            call_idx[call_now] = j
+            path_alive[call_now] = False
+        last_t = t
+    return call_time, call_idx, call_mask_at
+
+
+def price_note(spots, vols, divs, corr, obs_months, maturity, funding, barrier, call_coupon, notional, n_paths=40000, seed=7):
+    obs_years = [m / 12.0 for m in obs_months]
+    call_time, call_idx, call_mask_at = simulate_paths(spots, vols, divs, corr, obs_years, maturity, funding, n_paths=n_paths, seed=seed)
+    spots = np.asarray(spots, dtype=float)
+    vols = np.asarray(vols, dtype=float)
+    divs = np.asarray(divs, dtype=float)
+    n = len(spots)
+    rng = np.random.default_rng(seed + 999)
+    L = np.linalg.cholesky(corr)
+    call_pv = 0.0
+    call_prob = 0.0
+    for j, t in enumerate(sorted([x for x in obs_years if 0 < x <= maturity + 1e-12])):
+        z = rng.standard_normal((n_paths, n)) @ L.T
+        terminal = spots * np.exp((funding - divs - 0.5 * vols**2) * t + vols * np.sqrt(t) * z)
+        call_now = (terminal / spots).min(axis=1) >= 1.0
+        call_prob += call_now.mean()
+        call_pv += np.exp(-funding * t) * call_coupon * call_now.mean()
     z = rng.standard_normal((n_paths, n)) @ L.T
-    spots = np.array(spots, dtype=float)
-    vols = np.array(vols, dtype=float)
-    divs = np.array(divs, dtype=float)
-    drift = (funding - divs - 0.5 * vols**2) * maturity
-    shock = vols * np.sqrt(maturity)
-    terminal = spots * np.exp(drift + z * shock)
-    strikes = spots * barrier
-    worst_terminal = terminal.min(axis=1)
-    worst_strike = strikes.min()
-    payoff = np.maximum(0.0, 1.0 - worst_terminal / worst_strike)
-    pv = np.exp(-funding * maturity) * payoff.mean()
-    breach_prob = float((worst_terminal < worst_strike).mean())
-    return pv, breach_prob, terminal
+    terminal = spots * np.exp((funding - divs - 0.5 * vols**2) * maturity + vols * np.sqrt(maturity) * z)
+    worst_ratio = (terminal / spots).min(axis=1)
+    redemption = np.where(worst_ratio >= barrier, 1.0, np.maximum(0.0, worst_ratio / barrier))
+    maturity_pv = np.exp(-funding * maturity) * redemption.mean()
+    pv = float(call_pv + maturity_pv)
+    return pv, float(call_prob), call_time.mean()
 
 
 def load_template(path: Path):
@@ -122,10 +164,16 @@ with st.sidebar:
 n_under = st.sidebar.slider("Number of underlyings", 1, 4, 3)
 maturity = st.sidebar.number_input("Maturity (years)", 0.25, 5.0, float(vals.get("Maturity (years)", 1.0)), 0.25)
 funding = st.sidebar.number_input("Funding rate", 0.0, 0.25, float(vals.get("Funding rate", 0.0375)), 0.0025, format="%.4f")
-barrier = st.sidebar.number_input("Barrier %", 0.05, 1.0, float(vals.get("Barrier %", 0.5)), 0.05, format="%.2f")
+barrier = st.sidebar.number_input("Protection barrier %", 0.05, 1.0, float(vals.get("Barrier %", 0.5)), 0.05, format="%.2f")
+call_coupon = st.sidebar.number_input("Call coupon %", 0.0, 1.0, float(vals.get("Call coupon %", 0.0)), 0.01, format="%.2f")
 notional = st.sidebar.number_input("Notional", 1000.0, 10000000.0, float(vals.get("Notional", 100000.0)), 1000.0)
 auto_pull = st.sidebar.checkbox("Auto-pull Yahoo Finance data", True)
 use_corr = st.sidebar.checkbox("Use historical correlation", True)
+obs_count = st.sidebar.slider("Number of observation dates", 0, 3, 1)
+obs_months = []
+for i in range(obs_count):
+    default_months = [3, 6, 9][i]
+    obs_months.append(st.sidebar.number_input(f"Observation date {i+1} (months)", 1, max(1, int(maturity * 12)), default_months, 1))
 
 base_defaults = [str(vals.get(f"Underlying {i}", "")) for i in range(1, 5)]
 base_defaults = [b if b else d for b, d in zip(base_defaults, ["SOXX", "DRAM", "FXI", "AAPL"])]
@@ -161,48 +209,23 @@ if st.button("Price FCN"):
     spots = [r[1] for r in rows]
     vols = [r[2] for r in rows]
     divs = [r[3] for r in rows]
-    strikes = [s * barrier for s in spots]
-
-    if use_corr and len(tickers) > 1:
-        corr = hist_corr(tickers)
-    else:
-        corr = pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
-
+    corr = hist_corr(tickers) if use_corr and len(tickers) > 1 else pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     try:
-        pv, breach_prob, terminal = mc_worst_of(spots, vols, divs, corr.values, barrier, maturity, funding)
+        pv, call_prob, exp_call_time = price_note(spots, vols, divs, corr.values, obs_months, maturity, funding, barrier, call_coupon, notional)
         option_cost = pv * notional
-        coupon = funding + pv
-
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Embedded option cost", f"{pv:.4%}")
+        c1.metric("Embedded option value", f"{pv:.4%}")
         c2.metric("Option cost ($)", f"${option_cost:,.2f}")
-        c3.metric("Indicative coupon", f"{coupon:.4%}")
-        c4.metric("Coupon (bps)", f"{coupon*10000:.1f}")
-
+        c3.metric("Call probability", f"{call_prob:.2%}")
+        c4.metric("Expected call time", f"{exp_call_time:.2f}y")
         st.divider()
-        st.subheader("Pricing summary")
-        summary = pd.DataFrame({
-            "Metric": ["Breach probability", "Worst-of strike", "Maturity", "Funding rate", "Notional"],
-            "Value": [f"{breach_prob:.2%}", f"{barrier:.2%}", maturity, funding, f"${notional:,.0f}"]
-        })
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-
-        st.subheader("Inputs used")
         inp = pd.DataFrame(rows, columns=["Ticker", "Spot", "Vol", "Dividend Yield"])
-        inp["Strike"] = inp["Spot"] * barrier
+        inp["Barrier strike"] = inp["Spot"] * barrier
         st.dataframe(inp, use_container_width=True, hide_index=True)
-
-        st.subheader("Correlation matrix")
-        st.dataframe(corr, use_container_width=True)
-
-        st.subheader("Scenario sensitivity")
-        sens = []
-        for b in [0.40, 0.50, 0.60]:
-            pv_s, bp_s, _ = mc_worst_of(spots, vols, divs, corr.values, b, maturity, funding, n_paths=12000, seed=11)
-            sens.append([f"{b:.0%}", f"{pv_s:.2%}", f"{(funding + pv_s):.2%}"])
-        st.dataframe(pd.DataFrame(sens, columns=["Barrier", "Embedded cost", "Coupon"]), use_container_width=True, hide_index=True)
-
-        csv = inp.to_csv(index=False).encode("utf-8")
-        st.download_button("Download inputs CSV", csv, file_name="fcn_pricing_inputs.csv", mime="text/csv")
+        st.subheader("Observation dates")
+        st.write(obs_months if obs_months else ["None"])
+    except Exception as e:
+        st.error(str(e))
+t/csv")
     except Exception as e:
         st.error(str(e))
