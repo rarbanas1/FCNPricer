@@ -87,40 +87,31 @@ def price_note(spots, vols, divs, corr, obs_months, maturity, funding, knock_in,
     n = len(spots)
     L = np.linalg.cholesky(corr)
     obs_years = sorted([m / 12.0 for m in obs_months if 0 < m <= maturity * 12 + 1e-12])
-    obs_years = obs_years if obs_years else []
     rng = np.random.default_rng(seed)
 
-    discounted_payoffs = []
-    call_count = 0
-    total_paths = n_paths
-    survival = np.ones(n_paths, dtype=bool)
+    call_pv = 0.0
+    call_prob = 0.0
+    survival_prob = 1.0
 
-    prev_t = 0.0
     for t in obs_years:
-        dt = t - prev_t
-        if dt <= 0:
-            continue
         z = rng.standard_normal((n_paths, n)) @ L.T
         terminal = spots * np.exp((funding - divs - 0.5 * vols**2) * t + vols * np.sqrt(t) * z)
         worst_ratio = (terminal / spots).min(axis=1)
-        call_now = survival & (worst_ratio >= 1.0)
-        if call_now.any():
-            discounted_payoffs.append(np.exp(-funding * t) * (1.0 + call_coupon) * call_now.mean())
-            call_count += int(call_now.sum())
-            survival[call_now] = False
-        prev_t = t
+        call_now = (worst_ratio >= 1.0)
+        p_call = float(call_now.mean())
+        call_pv += np.exp(-funding * t) * (1.0 + call_coupon) * survival_prob * p_call
+        call_prob += survival_prob * p_call
+        survival_prob *= (1.0 - p_call)
 
     z = rng.standard_normal((n_paths, n)) @ L.T
     terminal = spots * np.exp((funding - divs - 0.5 * vols**2) * maturity + vols * np.sqrt(maturity) * z)
     worst_ratio = (terminal / spots).min(axis=1)
-
     maturity_payoff = np.where(worst_ratio >= 1.0, 1.0, np.where(worst_ratio >= knock_in, 1.0, worst_ratio))
-    maturity_pv = np.exp(-funding * maturity) * maturity_payoff.mean() * survival.mean()
+    maturity_pv = np.exp(-funding * maturity) * maturity_payoff.mean() * survival_prob
 
-    pv = float(sum(discounted_payoffs) + maturity_pv)
-    call_probability = float(call_count / total_paths)
+    pv = float(call_pv + maturity_pv)
     expected_call_time = float(np.mean(obs_years)) if obs_years else maturity
-    return pv, call_probability, expected_call_time
+    return pv, float(call_prob), expected_call_time
 
 
 def load_template(path: Path):
