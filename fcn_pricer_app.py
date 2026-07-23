@@ -1,6 +1,5 @@
 
 import math
-from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -11,271 +10,199 @@ from openpyxl import load_workbook
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Term-sheet-based FCN / autocallable pricer using Yahoo Finance inputs.")
+st.caption("Worst-of FCN pricer using Yahoo Finance data and correlated Monte Carlo.")
 
 TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
-
-
-def to_date(x):
-    if isinstance(x, date):
-        return x
-    if isinstance(x, datetime):
-        return x.date()
-    return pd.to_datetime(x).date()
-
-
-def year_frac(d1, d2):
-    return (to_date(d2) - to_date(d1)).days / 365.0
 
 
 def get_spot(ticker: str) -> float:
     hist = yf.Ticker(ticker).history(period="10d", auto_adjust=False)
     if hist.empty:
-        raise ValueError(f"No price history for {ticker}")
+        raise ValueError(f"No price data for {ticker}")
     return float(hist["Close"].dropna().iloc[-1])
 
 
-def get_dividend_yield(ticker: str) -> float:
-    info = yf.Ticker(ticker).info
-    dy = info.get("dividendYield", None)
-    if dy is None:
-        return 0.0
+def get_iv_proxy(ticker: str) -> float:
+    t = yf.Ticker(ticker)
     try:
-        return float(dy)
+        expiries = list(t.options or [])
+    except Exception:
+        expiries = []
+    for exp in expiries[:2]:
+        try:
+            chain = t.option_chain(exp).puts
+            if not chain.empty and "impliedVolatility" in chain.columns:
+                iv = float(chain["impliedVolatility"].dropna().median())
+                if 0 < iv < 5:
+                    return iv
+        except Exception:
+            pass
+    hist = t.history(period="1y", auto_adjust=False)
+    if hist.empty:
+        return 0.30
+    r = np.log(hist["Close"].dropna()).diff().dropna()
+    if r.empty:
+        return 0.30
+    return float(r.std() * np.sqrt(252))
+
+
+def get_dividend_yield(ticker: str) -> float:
+    try:
+        info = yf.Ticker(ticker).info or {}
+        return float(info.get("dividendYield") or 0.0)
     except Exception:
         return 0.0
-
-
-def get_volatility(ticker: str, lookback="1y") -> float:
-    hist = yf.Ticker(ticker).history(period=lookback, auto_adjust=True)
-    if hist.empty or len(hist) < 30:
-        raise ValueError(f"Not enough history for vol on {ticker}")
-    rets = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
-    vol = rets.std() * math.sqrt(252)
-    return float(vol)
 
 
 def hist_corr(tickers):
-    prices = []
-    for t in tickers:
-        hist = yf.Ticker(t).history(period="1y", auto_adjust=True)
-        if hist.empty:
-            raise ValueError(f"No history for correlation on {t}")
-        s = hist["Close"].rename(t)
-        prices.append(s)
-    df = pd.concat(prices, axis=1).dropna()
-    if df.shape[0] < 30:
-        raise ValueError("Not enough overlapping data for correlation")
-    rets = np.log(df / df.shift(1)).dropna()
-    corr = rets.corr().values
-    if corr.shape[0] != corr.shape[1]:
-        raise ValueError("Correlation matrix is not square")
-    for i in range(corr.shape[0]):
-        corr[i, i] = 1.0
-    return corr
+    frames = []
+    for tk in tickers:
+        try:
+            s = yf.Ticker(tk).history(period="1y", auto_adjust=False)["Close"].rename(tk)
+            frames.append(s)
+        except Exception:
+            pass
+    if len(frames) < 2:
+        return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
+    df = pd.concat(frames, axis=1).dropna()
+    if df.shape[1] < 2 or df.empty:
+        return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
+    ret = np.log(df).diff().dropna()
+    corr_df = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
+    corr_df = corr_df.clip(-1.0, 1.0)
+    corr_values = corr_df.values.astype(float, copy=True)
+    if corr_values.shape[0] == corr_values.shape[1] and corr_values.size > 0:
+        corr_values = (corr_values + corr_values.T) / 2.0
+        for i in range(corr_values.shape[0]):
+            corr_values[i, i] = 1.0
+    else:
+        corr_values = np.eye(len(tickers), dtype=float)
+    return pd.DataFrame(corr_values, index=tickers, columns=tickers)
 
 
-def cholesky_with_fallback(corr):
-    try:
-        return np.linalg.cholesky(corr)
-    except Exception:
-        eigvals, eigvecs = np.linalg.eigh(corr)
-        eigvals = np.clip(eigvals, 1e-8, None)
-        corr2 = eigvecs @ np.diag(eigvals) @ eigvecs.T
-        np.fill_diagonal(corr2, 1.0)
-        return np.linalg.cholesky(corr2)
-
-
-def simulate_paths(spot, vol, div, corr, maturity, n_paths=20000, steps=252, seed=11):
+def mc_worst_of(spots, vols, divs, corr, barrier, maturity, funding, n_paths=30000, seed=7):
     rng = np.random.default_rng(seed)
-    n = len(spot)
-    dt = maturity / steps
-    chol = cholesky_with_fallback(corr)
-    paths = np.zeros((n_paths, steps + 1, n), dtype=float)
-    paths[:, 0, :] = spot
-
-    drift = np.array([(0.0 - d - 0.5 * v * v) for d, v in zip(div, vol)], dtype=float)
-    diff = np.array(vol, dtype=float)
-
-    for t in range(1, steps + 1):
-        z = rng.standard_normal((n_paths, n))
-        zc = z @ chol.T
-        for i in range(n):
-            paths[:, t, i] = paths[:, t - 1, i] * np.exp((drift[i] * dt) + diff[i] * math.sqrt(dt) * zc[:, i])
-    return paths
-
-
-def worst_of_ratio(paths, spot):
-    rel = paths / np.array(spot)[None, None, :]
-    return rel.min(axis=2)
+    n = len(spots)
+    L = np.linalg.cholesky(corr)
+    z = rng.standard_normal((n_paths, n)) @ L.T
+    spots = np.array(spots, dtype=float)
+    vols = np.array(vols, dtype=float)
+    divs = np.array(divs, dtype=float)
+    drift = (funding - divs - 0.5 * vols**2) * maturity
+    shock = vols * np.sqrt(maturity)
+    terminal = spots * np.exp(drift + z * shock)
+    strikes = spots * barrier
+    worst_terminal = terminal.min(axis=1)
+    worst_strike = strikes.min()
+    payoff = np.maximum(0.0, 1.0 - worst_terminal / worst_strike)
+    pv = np.exp(-funding * maturity) * payoff.mean()
+    breach_prob = float((worst_terminal < worst_strike).mean())
+    return pv, breach_prob, terminal
 
 
-def price_fcn(
-    spot,
-    vol,
-    div,
-    corr,
-    valuation_date,
-    maturity_date,
-    call_dates,
-    coupon_dates,
-    obs_months,
-    coupon_rate,
-    notional,
-    call_barrier,
-    coupon_barrier,
-    knock_in_barrier,
-    n_paths=20000,
-    seed=11,
-):
-    maturity = max(year_frac(valuation_date, maturity_date), 0.01)
-    steps = max(252, int(252 * maturity))
-    paths = simulate_paths(spot, vol, div, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
-
-    call_times = [year_frac(valuation_date, d) for d in call_dates if to_date(d) > to_date(valuation_date)]
-    coupon_times = [year_frac(valuation_date, d) for d in coupon_dates if to_date(d) > to_date(valuation_date)]
-    call_idx = [min(steps, max(1, int(round(t / maturity * steps)))) for t in call_times]
-    coupon_idx = [min(steps, max(1, int(round(t / maturity * steps)))) for t in coupon_times]
-    maturity_idx = steps
-
-    worst_call = worst_of_ratio(paths, spot)
-    worst_maturity = worst_call[:, maturity_idx]
-
-    discount_rate = 0.0
-    dfs = {i: math.exp(-discount_rate * (i / steps) * maturity) for i in range(steps + 1)}
-
-    pv = np.zeros(n_paths)
-    called = np.zeros(n_paths, dtype=bool)
-    call_time_bucket = np.full(n_paths, np.nan)
-
-    for idx in call_idx:
-        alive = ~called
-        trigger = alive & (worst_call[:, idx] >= call_barrier)
-        if np.any(trigger):
-            t = idx / steps * maturity
-            pv[trigger] += (1.0 + coupon_rate * t) * notional * dfs[idx]
-            called[trigger] = True
-            call_time_bucket[trigger] = t
-
-    alive = ~called
-    if np.any(alive):
-        t = maturity
-        terminal = worst_maturity[alive]
-        payoff = np.where(
-            terminal >= coupon_barrier,
-            1.0 + coupon_rate * t,
-            np.where(terminal >= knock_in_barrier, 1.0 + coupon_rate * t, terminal),
-        )
-        pv[alive] += payoff * notional * dfs[maturity_idx]
-
-    note_pv = pv.mean()
-    call_prob = float(np.mean(called))
-    expected_call_time = float(np.nanmean(call_time_bucket)) if np.any(~np.isnan(call_time_bucket)) else float("nan")
-    expected_payoff = float(pv.mean() / notional)
-
-    coupon_value = coupon_rate
-    option_value = max(0.0, 1.0 - expected_payoff)
-
-    return {
-        "note_pv": note_pv,
-        "coupon_value": coupon_value,
-        "option_value": option_value,
-        "call_prob": call_prob,
-        "expected_call_time": expected_call_time,
-        "expected_payoff": expected_payoff,
-    }
+def load_template(path: Path):
+    wb = load_workbook(path, data_only=True)
+    ws = wb["Inputs"]
+    vals = {ws[f"A{i}"].value: ws[f"B{i}"].value for i in range(2, ws.max_row + 1)}
+    return vals
 
 
 with st.sidebar:
     st.header("Inputs")
-    n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
-    tickers = []
-    for i in range(n_names):
-        tickers.append(st.text_input(f"Ticker {i+1}", value=["C", "JPM", "BAC", "WFC"][i]))
-    valuation_date = st.date_input("Valuation date", value=date.today())
-    maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
-    coupon_rate = st.number_input("Coupon rate", min_value=0.0, value=0.12, step=0.005, format="%.4f")
-    notional = st.number_input("Notional", min_value=1.0, value=1000000.0, step=10000.0)
-    call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
-    coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
-    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
-    n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
-    seed = st.number_input("Random seed", min_value=1, value=11, step=1)
+    uploaded = st.file_uploader("Upload input workbook", type=["xlsx"])
+    use_template = st.checkbox("Use bundled template if no upload", value=True)
+    vals = {}
+    if uploaded is not None:
+        tmp = Path("uploaded_inputs.xlsx")
+        tmp.write_bytes(uploaded.getvalue())
+        vals = load_template(tmp)
+    elif use_template and TEMPLATE.exists():
+        vals = load_template(TEMPLATE)
 
-    st.subheader("Observation dates")
-    obs_months = st.multiselect(
-        "Months from valuation",
-        options=list(range(1, 61)),
-        default=[6, 12, 18],
-    )
+n_under = st.sidebar.slider("Number of underlyings", 1, 4, 3)
+maturity = st.sidebar.number_input("Maturity (years)", 0.25, 5.0, float(vals.get("Maturity (years)", 1.0)), 0.25)
+funding = st.sidebar.number_input("Funding rate", 0.0, 0.25, float(vals.get("Funding rate", 0.0375)), 0.0025, format="%.4f")
+barrier = st.sidebar.number_input("Barrier %", 0.05, 1.0, float(vals.get("Barrier %", 0.5)), 0.05, format="%.2f")
+notional = st.sidebar.number_input("Notional", 1000.0, 10000000.0, float(vals.get("Notional", 100000.0)), 1000.0)
+auto_pull = st.sidebar.checkbox("Auto-pull Yahoo Finance data", True)
+use_corr = st.sidebar.checkbox("Use historical correlation", True)
 
-try:
-    rows = []
-    for t in tickers:
-        spot = get_spot(t)
-        vol = get_volatility(t)
-        div = get_dividend_yield(t)
-        rows.append({"Ticker": t, "Spot": spot, "Vol": vol, "Dividend Yield": div})
+base_defaults = [str(vals.get(f"Underlying {i}", "")) for i in range(1, 5)]
+base_defaults = [b if b else d for b, d in zip(base_defaults, ["SOXX", "DRAM", "FXI", "AAPL"])]
 
-    inp = pd.DataFrame(rows)
-    spot = inp["Spot"].tolist()
-    vol = inp["Vol"].tolist()
-    div = inp["Dividend Yield"].tolist()
+st.subheader("Underlying setup")
+cols = st.columns(n_under)
+rows = []
+for i in range(n_under):
+    with cols[i]:
+        tk = st.text_input(f"Ticker {i+1}", value=base_defaults[i], key=f"tk_{i}")
+        if auto_pull:
+            try:
+                spot_auto = get_spot(tk)
+            except Exception:
+                spot_auto = 100.0
+            try:
+                vol_auto = get_iv_proxy(tk)
+            except Exception:
+                vol_auto = 0.30
+            try:
+                div_auto = get_dividend_yield(tk)
+            except Exception:
+                div_auto = 0.0
+        else:
+            spot_auto, vol_auto, div_auto = 100.0, 0.30, 0.0
+        spot = st.number_input(f"Spot {tk}", value=float(spot_auto), step=0.01, format="%.2f", key=f"spot_{i}")
+        vol = st.number_input(f"Vol {tk}", value=float(vol_auto), step=0.01, format="%.4f", key=f"vol_{i}")
+        div = st.number_input(f"Dividend yield {tk}", value=float(div_auto), step=0.001, format="%.4f", key=f"div_{i}")
+        rows.append((tk, spot, vol, div))
 
-    corr = hist_corr(tickers)
+if st.button("Price FCN"):
+    tickers = [r[0] for r in rows]
+    spots = [r[1] for r in rows]
+    vols = [r[2] for r in rows]
+    divs = [r[3] for r in rows]
+    strikes = [s * barrier for s in spots]
 
-    call_dates = [valuation_date + timedelta(days=int(30.4375 * m)) for m in obs_months]
-    coupon_dates = [maturity_date]
+    if use_corr and len(tickers) > 1:
+        corr = hist_corr(tickers)
+    else:
+        corr = pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
 
-    result = price_fcn(
-        spot=spot,
-        vol=vol,
-        div=div,
-        corr=corr,
-        valuation_date=valuation_date,
-        maturity_date=maturity_date,
-        call_dates=call_dates,
-        coupon_dates=coupon_dates,
-        obs_months=obs_months,
-        coupon_rate=coupon_rate,
-        notional=notional,
-        call_barrier=call_barrier,
-        coupon_barrier=coupon_barrier,
-        knock_in_barrier=knock_in_barrier,
-        n_paths=int(n_paths),
-        seed=int(seed),
-    )
+    try:
+        pv, breach_prob, terminal = mc_worst_of(spots, vols, divs, corr.values, barrier, maturity, funding)
+        option_cost = pv * notional
+        coupon = funding + pv
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Note PV", f"{result['note_pv']:,.2f}")
-    c2.metric("Coupon value", f"{result['coupon_value']:.2%}")
-    c3.metric("Call probability", f"{result['call_prob']:.2%}")
-    c4.metric(
-        "Expected call time",
-        "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y",
-    )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Embedded option cost", f"{pv:.4%}")
+        c2.metric("Option cost ($)", f"${option_cost:,.2f}")
+        c3.metric("Indicative coupon", f"{coupon:.4%}")
+        c4.metric("Coupon (bps)", f"{coupon*10000:.1f}")
 
-    st.subheader("Market inputs")
-    inp["Knock-in strike"] = inp["Spot"] * knock_in_barrier
-    inp["Coupon strike"] = inp["Spot"] * coupon_barrier
-    inp["Call strike"] = inp["Spot"] * call_barrier
-    st.dataframe(inp, use_container_width=True, hide_index=True)
+        st.divider()
+        st.subheader("Pricing summary")
+        summary = pd.DataFrame({
+            "Metric": ["Breach probability", "Worst-of strike", "Maturity", "Funding rate", "Notional"],
+            "Value": [f"{breach_prob:.2%}", f"{barrier:.2%}", maturity, funding, f"${notional:,.0f}"]
+        })
+        st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    st.subheader("Schedule")
-    sch_rows = [{"Type": "Valuation", "Date": str(valuation_date)}]
-    sch_rows += [{"Type": "Call", "Date": str(d)} for d in call_dates]
-    sch_rows += [{"Type": "Coupon", "Date": str(d)} for d in coupon_dates]
-    sch_rows += [{"Type": "Maturity", "Date": str(maturity_date)}]
-    st.dataframe(pd.DataFrame(sch_rows), use_container_width=True, hide_index=True)
+        st.subheader("Inputs used")
+        inp = pd.DataFrame(rows, columns=["Ticker", "Spot", "Vol", "Dividend Yield"])
+        inp["Strike"] = inp["Spot"] * barrier
+        st.dataframe(inp, use_container_width=True, hide_index=True)
 
-    st.subheader("Model notes")
-    st.write(
-        "The note is called if all underlyings are at or above the call barrier on an observation date. "
-        "If it is not called, maturity redemption depends on the worst performer versus the coupon and knock-in barriers."
-    )
+        st.subheader("Correlation matrix")
+        st.dataframe(corr, use_container_width=True)
 
-    csv = inp.to_csv(index=False).encode("utf-8")
-    st.download_button("Download inputs CSV", csv, file_name="fcn_pricing_inputs.csv", mime="text/csv")
+        st.subheader("Scenario sensitivity")
+        sens = []
+        for b in [0.40, 0.50, 0.60]:
+            pv_s, bp_s, _ = mc_worst_of(spots, vols, divs, corr.values, b, maturity, funding, n_paths=12000, seed=11)
+            sens.append([f"{b:.0%}", f"{pv_s:.2%}", f"{(funding + pv_s):.2%}"])
+        st.dataframe(pd.DataFrame(sens, columns=["Barrier", "Embedded cost", "Coupon"]), use_container_width=True, hide_index=True)
 
-except Exception as e:
-    st.error(str(e))
+        csv = inp.to_csv(index=False).encode("utf-8")
+        st.download_button("Download inputs CSV", csv, file_name="fcn_pricing_inputs.csv", mime="text/csv")
+    except Exception as e:
+        st.error(str(e))
