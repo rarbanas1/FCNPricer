@@ -1,12 +1,18 @@
 
 import math
 from datetime import date, datetime, timedelta
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 # =========================
 # API KEYS: FILL THESE IN
@@ -455,6 +461,113 @@ def fmt(x, pct=False):
     return f"{x:.2%}" if pct else f"{x:.4f}" if abs(x) < 1 else f"{x:.2f}"
 
 
+def _table_style(header=False):
+    style = [
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+    if header:
+        style += [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ]
+    return TableStyle(style)
+
+
+def build_pdf_report(inputs, edited_df, corr_df, schedule_df, result):
+    """Render a one-page(ish) PDF summary of the term sheet, market inputs,
+    correlation matrix, valuation results, and schedule -- everything shown
+    on screen after Calculate, in a form that can be saved and shared."""
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+    )
+    styles = getSampleStyleSheet()
+    small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
+
+    elements = [
+        Paragraph("FCN Pricer &mdash; Term Sheet &amp; Valuation Summary", styles["Title"]),
+        Paragraph(
+            f"Underlyings: {', '.join(inputs['tickers'])} &nbsp;|&nbsp; Generated: {inputs['generated_at']}",
+            small,
+        ),
+        Spacer(1, 0.2 * inch),
+        Paragraph("Product Terms", styles["Heading2"]),
+    ]
+
+    terms_data = [
+        ["Valuation date", str(inputs["valuation_date"])],
+        ["Maturity date", str(inputs["maturity_date"])],
+        ["Notional", f"{inputs['notional']:,.2f}"],
+        ["Funding cost (input)", f"{inputs['funding_cost']:.2%}"],
+        ["Risk-free rate", f"{inputs['risk_free_rate']:.2%}"],
+        ["Call barrier", f"{inputs['call_barrier']:.4f}"],
+        ["Strike (coupon barrier)", f"{inputs['coupon_barrier']:.4f}"],
+        ["Knock-in barrier", f"{inputs['knock_in_barrier']:.4f}"],
+        ["Observation months", ", ".join(str(m) for m in inputs["obs_months"]) or "None"],
+        ["Simulation paths / seed", f"{inputs['n_paths']} / {inputs['seed']}"],
+    ]
+    t = Table(terms_data, colWidths=[2.2 * inch, 3.7 * inch])
+    t.setStyle(_table_style())
+    elements += [t, Spacer(1, 0.2 * inch), Paragraph("Market Data &amp; Strike", styles["Heading2"])]
+
+    md_rows = [["Ticker", "Spot", "Vol", "Div Yld", "Strike ($)", "Spot Src", "IV Src", "Div Src"]]
+    for _, row in edited_df.iterrows():
+        strike_px = float(row["Spot"]) * inputs["coupon_barrier"]
+        md_rows.append([
+            row["Ticker"], f"{row['Spot']:.2f}", f"{row['Vol']:.2%}", f"{row['Dividend Yield']:.2%}",
+            f"{strike_px:.2f}", row["Spot Source"], row["IV Source"], row["Div Source"],
+        ])
+    t2 = Table(md_rows, colWidths=[0.55 * inch, 0.6 * inch, 0.55 * inch, 0.6 * inch, 0.65 * inch,
+                                    1.0 * inch, 1.0 * inch, 1.0 * inch])
+    t2.setStyle(_table_style(header=True))
+    elements += [t2, Spacer(1, 0.2 * inch), Paragraph("Correlation Matrix", styles["Heading2"])]
+
+    corr_rows = [[""] + list(corr_df.columns)]
+    for idx, row in corr_df.iterrows():
+        corr_rows.append([idx] + [f"{v:.4f}" for v in row.values])
+    t3 = Table(corr_rows)
+    t3.setStyle(_table_style(header=True))
+    elements += [t3, Spacer(1, 0.2 * inch), Paragraph("Valuation Results", styles["Heading2"])]
+
+    res_rows = [
+        ["Note PV @ funding cost", f"{result['note_pv']:,.2f}"],
+        ["Funding cost (input)", f"{result['funding_cost']:.2%}"],
+        ["Option value (spread)", "N/A" if math.isnan(result['option_value']) else f"{result['option_value']:.2%}"],
+        ["Fair coupon (solves to par)", "N/A" if math.isnan(result['coupon_rate']) else f"{result['coupon_rate']:.2%}"],
+        ["Call probability", f"{result['call_prob']:.2%}"],
+        ["Expected call time", "N/A" if math.isnan(result['expected_call_time']) else f"{result['expected_call_time']:.2f}y"],
+        ["Discount rate used", f"{result['discount_rate']:.2%}"],
+    ]
+    t4 = Table(res_rows, colWidths=[2.8 * inch, 2.8 * inch])
+    t4.setStyle(_table_style())
+    elements += [t4, Spacer(1, 0.2 * inch), Paragraph("Schedule", styles["Heading2"])]
+
+    sched_rows = [list(schedule_df.columns)] + schedule_df.values.tolist()
+    t5 = Table(sched_rows, colWidths=[2.5 * inch, 2.5 * inch])
+    t5.setStyle(_table_style(header=True))
+    elements += [
+        t5, Spacer(1, 0.3 * inch),
+        Paragraph(
+            "Monte Carlo valuation for internal research use only. Not a market-executable price "
+            "and not an offer or solicitation.",
+            small,
+        ),
+    ]
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 if "step" not in st.session_state:
     st.session_state.step = 1
 if "candidates" not in st.session_state:
@@ -462,16 +575,31 @@ if "candidates" not in st.session_state:
 
 st.header("Inputs and assumptions")
 
+with st.expander("How this works", expanded=False):
+    st.markdown(
+        "1. **Enter the product terms** below, then click **Load market candidates** to pull "
+        "live spot / vol / dividend data for each underlying.\n"
+        "2. **Review and confirm** the market inputs -- pick a source or type a value for each "
+        "field per ticker.\n"
+        "3. Click **Calculate** to run the Monte Carlo valuation. Results, the correlation matrix, "
+        "and the schedule appear below, with a button to download everything as a PDF."
+    )
+
 c1, c2 = st.columns([2, 1])
 with c1:
     n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
     default_tickers = ["DRAM", "SOXX", "FXI", "XLK"]
     tickers = [st.text_input(f"Ticker {i+1}", value=default_tickers[i]) for i in range(n_names)]
     valuation_date = st.date_input("Valuation date", value=date.today())
-    maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
+    maturity_date = st.date_input(
+        "Maturity date",
+        value=date.today() + timedelta(days=365),
+        help="Defaults to 12 months from the valuation date.",
+    )
     notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
 with c2:
-    funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f")
+    funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f",
+                                     help="The issuer's own cost of funds -- the base rate before adding the value of the embedded option.")
     risk_free_rate = st.number_input(
         "Risk-free rate (annual)",
         min_value=0.0,
@@ -481,16 +609,24 @@ with c2:
         help="Used for risk-neutral drift and discounting. Previously hardcoded to 0 in the pricing model.",
     )
 
+st.markdown("#### Barriers")
+st.caption(
+    "All barriers are expressed as a fraction of each underlying's initial spot (e.g. 0.50 = 50% of spot)."
+)
 b1, b2, b3 = st.columns(3)
 with b1:
-    call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
-    coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
+    call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f",
+                                     help="The note is called early, returning principal + accrued coupon, if the worst performer is at or above this level on an observation date.")
+    coupon_barrier = st.number_input("Strike (% of spot)", min_value=0.0, value=0.5, step=0.01, format="%.4f",
+                                       help="The level at which the embedded put is struck. Below the knock-in barrier at maturity, redemption is notional x (worst performer / this strike). Shown in dollar terms per underlying after you load market data.")
 with b2:
-    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
+    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f",
+                                         help="Principal protection threshold. At or above this level at maturity, you get par + coupon regardless of the strike. Set below the strike for a protective cushion.")
     n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
 with b3:
     seed = st.number_input("Random seed", min_value=1, value=11, step=1)
-    obs_months = st.multiselect("Months from valuation", options=list(range(1, 61)), default=[6])
+    obs_months = st.multiselect("Months from valuation", options=list(range(1, 61)), default=[6],
+                                  help="Call/coupon observation dates, in months from the valuation date. Default is a single 6-month observation.")
 
 st.markdown("### Step 1")
 st.write("Enter the product terms above.")
@@ -595,29 +731,78 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
                 n_paths=int(n_paths), seed=int(seed),
             )
 
-            st.subheader("Results")
-            a, b, c, d = st.columns(4)
-            a.metric("Note PV @ funding cost", f"{result['note_pv']:,.2f}",
-                      help="Discounted PV of the note's cash flows if the coupon is set at 'Funding cost'. Below notional means that coupon is not sufficient to price the note to par; can be negative relative to par.")
-            b.metric("Funding cost (input)", f"{result['funding_cost']:.2%}")
-            c.metric("Option value (spread)", "N/A" if np.isnan(result['option_value']) else f"{result['option_value']:.2%}",
-                      help="Fair coupon minus funding cost. No longer floored at zero -- a negative value means the input funding cost already overpays relative to the embedded optionality.")
-            d.metric("Fair coupon (solves to par)", "N/A" if np.isnan(result['coupon_rate']) else f"{result['coupon_rate']:.2%}",
-                      help="The coupon rate at which Note PV would equal notional exactly, solved directly from the simulation.")
-
-            e, f, g = st.columns(3)
-            e.metric("Call probability", f"{result['call_prob']:.2%}")
-            f.metric("Expected call time", "N/A" if np.isnan(result['expected_call_time']) else f"{result['expected_call_time']:.2f}y")
-            g.metric("Discount rate used", f"{result['discount_rate']:.2%}")
-
-            st.subheader("Confirmed market data")
-            st.dataframe(edited, use_container_width=True, hide_index=True)
-
-            st.subheader("Correlation matrix")
-            st.dataframe(corr.round(4), use_container_width=True)
-
-            st.subheader("Schedule")
-            st.dataframe(build_schedule(valuation_date, obs_months, maturity_date), use_container_width=True, hide_index=True)
-
+            # Stash everything in session_state rather than rendering directly here.
+            # Streamlit reruns the whole script on every widget interaction, and a
+            # plain `if st.button("Calculate")` block only stays True for the single
+            # rerun right after the click -- clicking the PDF download button below
+            # would otherwise trigger a rerun where Calculate reads False again and
+            # the entire Results section (download button included) disappears.
+            st.session_state.last_result = result
+            st.session_state.last_edited = inp
+            st.session_state.last_corr = corr
+            st.session_state.last_schedule = build_schedule(valuation_date, obs_months, maturity_date)
+            st.session_state.last_inputs = {
+                "tickers": [t.upper().strip() for t in tickers],
+                "valuation_date": valuation_date,
+                "maturity_date": maturity_date,
+                "notional": notional,
+                "funding_cost": funding_cost,
+                "risk_free_rate": risk_free_rate,
+                "call_barrier": call_barrier,
+                "coupon_barrier": coupon_barrier,
+                "knock_in_barrier": knock_in_barrier,
+                "obs_months": obs_months,
+                "n_paths": int(n_paths),
+                "seed": int(seed),
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+            st.session_state.calc_error = None
         except Exception as ex:
-            st.error(str(ex))
+            st.session_state.calc_error = str(ex)
+            st.session_state.last_result = None
+
+    if st.session_state.get("calc_error"):
+        st.error(st.session_state.calc_error)
+
+    if st.session_state.get("last_result") is not None:
+        result = st.session_state.last_result
+        edited_result = st.session_state.last_edited
+        corr = st.session_state.last_corr
+        schedule_df = st.session_state.last_schedule
+        pdf_inputs = st.session_state.last_inputs
+
+        st.subheader("Results")
+        a, b, c, d = st.columns(4)
+        a.metric("Note PV @ funding cost", f"{result['note_pv']:,.2f}",
+                  help="Discounted PV of the note's cash flows if the coupon is set at 'Funding cost'. Below notional means that coupon is not sufficient to price the note to par; can be negative relative to par.")
+        b.metric("Funding cost (input)", f"{result['funding_cost']:.2%}")
+        c.metric("Option value (spread)", "N/A" if np.isnan(result['option_value']) else f"{result['option_value']:.2%}",
+                  help="Fair coupon minus funding cost. No longer floored at zero -- a negative value means the input funding cost already overpays relative to the embedded optionality.")
+        d.metric("Fair coupon (solves to par)", "N/A" if np.isnan(result['coupon_rate']) else f"{result['coupon_rate']:.2%}",
+                  help="The coupon rate at which Note PV would equal notional exactly, solved directly from the simulation.")
+
+        e, f, g = st.columns(3)
+        e.metric("Call probability", f"{result['call_prob']:.2%}")
+        f.metric("Expected call time", "N/A" if np.isnan(result['expected_call_time']) else f"{result['expected_call_time']:.2f}y")
+        g.metric("Discount rate used", f"{result['discount_rate']:.2%}")
+
+        st.subheader("Confirmed market data")
+        display_df = edited_result.copy()
+        display_df["Strike ($)"] = display_df["Spot"] * pdf_inputs["coupon_barrier"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Correlation matrix")
+        st.dataframe(corr.round(4), use_container_width=True)
+
+        st.subheader("Schedule")
+        st.dataframe(schedule_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Export")
+        pdf_bytes = build_pdf_report(pdf_inputs, edited_result, corr, schedule_df, result)
+        st.download_button(
+            "Download PDF summary",
+            data=pdf_bytes,
+            file_name=f"FCN_{'-'.join(pdf_inputs['tickers'])}_{pdf_inputs['valuation_date']}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
