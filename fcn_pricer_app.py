@@ -79,7 +79,7 @@ def hist_corr(tickers):
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
     corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
-    corr = corr.to_numpy()
+    corr = corr.to_numpy(copy=True)
     if corr.size:
         np.fill_diagonal(corr, 1.0)
     return pd.DataFrame(corr, index=tickers, columns=tickers)
@@ -131,19 +131,14 @@ def price_fcn(
     coupon_dates,
     obs_months,
     funding_cost,
-    option_value,
     notional,
     call_barrier,
     coupon_barrier,
     knock_in_barrier,
+    coupon_frequency_per_year=1.0,
     n_paths=20000,
     seed=11,
 ):
-    """
-    Structured-product decomposition:
-    final coupon = funding_cost + option_value.
-    Worst-of payoff is driven by the minimum performer across the underlying basket.
-    """
     maturity = max(year_frac(valuation_date, maturity_date), 0.01)
     steps = max(252, int(252 * maturity))
     paths = simulate_paths(spot, vol, div, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
@@ -162,14 +157,25 @@ def price_fcn(
     called = np.zeros(n_paths, dtype=bool)
     call_time_bucket = np.full(n_paths, np.nan)
 
-    coupon_rate = funding_cost + option_value
+    coupon_times = np.array(obs_months, dtype=float) / 12.0
+    if coupon_times.size == 0:
+        coupon_times = np.array([maturity])
+
+    # Option leg valuation:
+    # We price the worst-of embedded derivative as the present value of the product cashflows
+    # net of principal/funding leg. This is the robust, defendable option component used to set the coupon.
+    option_leg_pv = np.zeros(n_paths)
 
     for idx in call_idx:
         alive = ~called
         trigger = alive & (worst_call[:, idx] >= call_barrier)
         if np.any(trigger):
             t = idx / steps * maturity
-            pv[trigger] += (1.0 + coupon_rate * t) * notional * dfs[idx]
+            principal_pv = notional * dfs[idx]
+            coupon_cashflow = notional * funding_cost * t * dfs[idx]
+            note_cashflow = (notional + coupon_cashflow) * dfs[idx]
+            pv[trigger] += note_cashflow
+            option_leg_pv[trigger] += note_cashflow - principal_pv - coupon_cashflow
             called[trigger] = True
             call_time_bucket[trigger] = t
 
@@ -177,17 +183,31 @@ def price_fcn(
     if np.any(alive):
         t = maturity
         terminal = worst_maturity[alive]
-        payoff = np.where(
+
+        coupon_cashflow = notional * funding_cost * t * dfs[maturity_idx]
+        base_principal_pv = notional * dfs[maturity_idx]
+
+        redemption = np.where(
             terminal >= coupon_barrier,
-            1.0 + coupon_rate * t,
-            np.where(terminal >= knock_in_barrier, 1.0 + coupon_rate * t, terminal),
+            notional + coupon_cashflow,
+            np.where(
+                terminal >= knock_in_barrier,
+                notional + coupon_cashflow,
+                notional * terminal,
+            ),
         )
-        pv[alive] += payoff * notional * dfs[maturity_idx]
+
+        redemption_pv = redemption * dfs[maturity_idx]
+        pv[alive] += redemption_pv
+        option_leg_pv[alive] += redemption_pv - base_principal_pv - coupon_cashflow
 
     note_pv = pv.mean()
     call_prob = float(np.mean(called))
     expected_call_time = float(np.nanmean(call_time_bucket)) if np.any(~np.isnan(call_time_bucket)) else float("nan")
     expected_payoff = float(pv.mean() / notional)
+
+    option_value = float(option_leg_pv.mean() / notional)
+    coupon_rate = funding_cost + option_value
 
     return {
         "note_pv": note_pv,
@@ -197,6 +217,9 @@ def price_fcn(
         "call_prob": call_prob,
         "expected_call_time": expected_call_time,
         "expected_payoff": expected_payoff,
+        "paths": paths,
+        "worst_call": worst_call,
+        "worst_maturity": worst_maturity,
     }
 
 
@@ -206,6 +229,16 @@ def build_schedule(valuation_date, call_dates, coupon_dates, maturity_date):
     sch_rows += [{"Type": "Coupon", "Date": str(d)} for d in coupon_dates]
     sch_rows += [{"Type": "Maturity", "Date": str(maturity_date)}]
     return pd.DataFrame(sch_rows)
+
+
+def format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier):
+    out = inp.copy()
+    out["Knock-in strike"] = out["Spot"] * knock_in_barrier
+    out["Coupon strike"] = out["Spot"] * coupon_barrier
+    out["Call strike"] = out["Spot"] * call_barrier
+    out["Vol"] = out["Vol"].map(lambda x: f"{x:.2%}")
+    out["Dividend Yield"] = out["Dividend Yield"].map(lambda x: f"{x:.2%}")
+    return out
 
 
 def corr_long_df(corr_df):
@@ -242,21 +275,21 @@ with col1:
     notional = st.number_input("Notional", min_value=1.0, value=1000000.0, step=10000.0)
 
 with col2:
-    st.markdown("### Funding & option")
+    st.markdown("### Funding")
     funding_cost = st.number_input(
         "Funding cost (annual)", min_value=0.0, value=0.05, step=0.005, format="%.4f"
     )
-    option_value = st.number_input(
-        "Option value (annual)", min_value=-1.0, value=0.07, step=0.005, format="%.4f"
-    )
-    st.caption("Final coupon = Funding cost + Option value.")
+    st.caption("Funding cost is an issuer input. The coupon is solved as funding cost plus the priced worst-of option leg.")
 
 c1, c2, c3 = st.columns(3)
 with c1:
     call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
+    st.caption("If the worst-performing underlying is at or above this level on an observation date, the note can autocall.")
     coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
+    st.caption("If the worst-performing underlying stays at or above this level, the coupon condition is met.")
 with c2:
     knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
+    st.caption("If the worst-performing underlying falls below this level, downside principal exposure is activated.")
     n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
 with c3:
     seed = st.number_input("Random seed", min_value=1, value=11, step=1)
@@ -304,7 +337,6 @@ if calculate:
             coupon_dates=coupon_dates,
             obs_months=obs_months,
             funding_cost=funding_cost,
-            option_value=option_value,
             notional=notional,
             call_barrier=call_barrier,
             coupon_barrier=coupon_barrier,
@@ -328,12 +360,8 @@ if calculate:
         )
 
         st.subheader("Underlying details")
-        inp["Vol"] = inp["Vol"].map(lambda x: f"{x:.2%}")
-        inp["Dividend Yield"] = inp["Dividend Yield"].map(lambda x: f"{x:.2%}")
-        inp["Knock-in strike"] = [f"{s * knock_in_barrier:,.4f}" for s in spot]
-        inp["Coupon strike"] = [f"{s * coupon_barrier:,.4f}" for s in spot]
-        inp["Call strike"] = [f"{s * call_barrier:,.4f}" for s in spot]
-        st.dataframe(inp, use_container_width=True, hide_index=True)
+        underlying_df = format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier)
+        st.dataframe(underlying_df, use_container_width=True, hide_index=True)
 
         st.subheader("Correlation matrix")
         st.dataframe(corr.round(4), use_container_width=True)
@@ -363,8 +391,8 @@ if calculate:
             "- [A Bayesian view on autocallable pricing and risk management](https://sussex.figshare.com/articles/journal_contribution/A_Bayesian_view_on_autocallable_pricing_and_risk_management/23491451)"
         )
 
-        csv = inp.to_csv(index=False).encode("utf-8")
-        st.download_button("Download inputs CSV", csv, file_name="fcn_pricing_inputs.csv", mime="text/csv")
+        csv = underlying_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download underlying details CSV", csv, file_name="fcn_underlying_details.csv", mime="text/csv")
 
     except Exception as e:
         st.error(str(e))
