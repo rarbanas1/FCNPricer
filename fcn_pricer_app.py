@@ -322,14 +322,17 @@ def cholesky_with_fallback(corr):
         return np.linalg.cholesky(corr2)
 
 
-def simulate_paths(spot, vol, div, corr, maturity, n_paths=12000, steps=252, seed=11):
+def simulate_paths(spot, vol, div, r, corr, maturity, n_paths=12000, steps=252, seed=11):
     rng = np.random.default_rng(seed)
     n = len(spot)
     dt = maturity / steps
     chol = cholesky_with_fallback(corr)
     paths = np.zeros((n_paths, steps + 1, n), dtype=float)
     paths[:, 0, :] = spot
-    drift = np.array([(0.0 - d - 0.5 * v * v) for d, v in zip(div, vol)], dtype=float)
+    # Risk-neutral drift: r (risk-free) - q (dividend yield) - 0.5*sigma^2.
+    # r was previously hardcoded to 0 here, which understates drift and,
+    # combined with no discounting downstream, materially mispriced the note.
+    drift = np.array([(r - d - 0.5 * v * v) for d, v in zip(div, vol)], dtype=float)
     diff = np.array(vol, dtype=float)
 
     for t in range(1, steps + 1):
@@ -344,11 +347,14 @@ def worst_of_ratio(paths, spot):
     return (paths / np.array(spot)[None, None, :]).min(axis=2)
 
 
-def price_fcn(spot, vol, div, corr, valuation_date, maturity_date, obs_months, funding_cost, notional,
+def price_fcn(spot, vol, div, corr, r, valuation_date, maturity_date, obs_months, funding_cost, notional,
               call_barrier, coupon_barrier, knock_in_barrier, n_paths=12000, seed=11):
+    if coupon_barrier <= 0:
+        raise ValueError("Coupon barrier (strike) must be > 0.")
+
     maturity = max(year_frac(valuation_date, maturity_date), 0.01)
     steps = max(252, int(252 * maturity))
-    paths = simulate_paths(spot, vol, div, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
+    paths = simulate_paths(spot, vol, div, r, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
 
     obs_times = [year_frac(valuation_date, valuation_date + timedelta(days=int(30.4375 * m))) for m in obs_months]
     obs_idx = [min(steps, max(1, int(round(t / maturity * steps)))) for t in obs_times]
@@ -356,7 +362,17 @@ def price_fcn(spot, vol, div, corr, valuation_date, maturity_date, obs_months, f
     worst = worst_of_ratio(paths, spot)
     terminal = worst[:, -1]
 
-    pv = np.zeros(n_paths)
+    # The coupon (funding_cost) enters every payoff branch linearly, so instead
+    # of simulating at one fixed coupon and hoping it happens to price to par,
+    # we split each path's discounted cash flow into two pieces:
+    #   A = principal-side PV, independent of the coupon rate
+    #   B = PV of a 1.0 coupon-rate's worth of accrual on that path
+    # note_pv(c) = A + c*B for ANY coupon c, so the coupon that prices the
+    # note to par is solved directly: fair_coupon = (notional - A) / B.
+    # This also removes the old max(0, ...) floor, which was silently
+    # hiding negative results instead of reporting them.
+    A = np.zeros(n_paths)
+    B = np.zeros(n_paths)
     called = np.zeros(n_paths, dtype=bool)
     call_time_bucket = np.full(n_paths, np.nan)
 
@@ -365,34 +381,54 @@ def price_fcn(spot, vol, div, corr, valuation_date, maturity_date, obs_months, f
         trigger = alive & (worst[:, idx] >= call_barrier)
         if np.any(trigger):
             t = idx / steps * maturity
-            cash = notional + notional * funding_cost * t
-            pv[trigger] += cash
+            df = math.exp(-r * t)
+            A[trigger] += notional * df
+            B[trigger] += notional * t * df
             called[trigger] = True
             call_time_bucket[trigger] = t
 
     alive = ~called
+    df_T = math.exp(-r * maturity)
     if np.any(alive):
-        coupon = notional * funding_cost * maturity
-        redemption = np.where(
-            terminal[alive] >= coupon_barrier,
-            notional + coupon,
-            np.where(terminal[alive] >= knock_in_barrier, notional + coupon, notional * terminal[alive]),
-        )
-        pv[alive] += redemption
+        # Knock-in barrier gates protection. If knock_in_barrier < coupon_barrier,
+        # the zone between them is a cushion: still fully protected (par + coupon)
+        # even though the worst performer is already below the strike.
+        safe = alive & (terminal >= knock_in_barrier)
+        breach = alive & (terminal < knock_in_barrier)
 
-    note_pv = pv.mean()
+        A[safe] += notional * df_T
+        B[safe] += notional * maturity * df_T
+
+        # Below knock-in, the embedded put (struck at coupon_barrier) is live:
+        # redemption reflects the worst performer's level relative to the
+        # strike, not relative to 100% spot. No coupon accrues on these paths.
+        A[breach] += notional * (terminal[breach] / coupon_barrier) * df_T
+
+    A_bar = float(A.mean())
+    B_bar = float(B.mean())
+
+    if B_bar <= 0:
+        fair_coupon = float("nan")
+        option_value = float("nan")
+        note_pv_fair = float("nan")
+    else:
+        fair_coupon = (notional - A_bar) / B_bar
+        option_value = fair_coupon - funding_cost
+        note_pv_fair = A_bar + fair_coupon * B_bar
+
+    note_pv_input = A_bar + funding_cost * B_bar
     call_prob = float(np.mean(called))
     expected_call_time = float(np.nanmean(call_time_bucket)) if np.any(~np.isnan(call_time_bucket)) else float("nan")
-    option_value = max(0.0, float(note_pv / notional - 1.0))
-    coupon_rate = funding_cost + option_value
 
     return {
-        "note_pv": note_pv,
-        "coupon_rate": coupon_rate,
+        "note_pv": note_pv_input,
+        "note_pv_at_fair_coupon": note_pv_fair,
+        "coupon_rate": fair_coupon,
         "funding_cost": funding_cost,
         "option_value": option_value,
         "call_prob": call_prob,
         "expected_call_time": expected_call_time,
+        "discount_rate": r,
     }
 
 
@@ -426,6 +462,14 @@ with c1:
     notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
 with c2:
     funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f")
+    risk_free_rate = st.number_input(
+        "Risk-free rate (annual)",
+        min_value=0.0,
+        value=0.04,
+        step=0.0025,
+        format="%.4f",
+        help="Used for risk-neutral drift and discounting. Previously hardcoded to 0 in the pricing model.",
+    )
 
 b1, b2, b3 = st.columns(3)
 with b1:
@@ -535,7 +579,7 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
 
             corr = hist_corr([t.upper().strip() for t in tickers])
             result = price_fcn(
-                spot, vol, div, corr,
+                spot, vol, div, corr, risk_free_rate,
                 valuation_date, maturity_date, obs_months,
                 funding_cost, notional, call_barrier, coupon_barrier, knock_in_barrier,
                 n_paths=int(n_paths), seed=int(seed),
@@ -543,14 +587,18 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
 
             st.subheader("Results")
             a, b, c, d = st.columns(4)
-            a.metric("Note PV", f"{result['note_pv']:,.2f}")
-            b.metric("Funding cost", f"{result['funding_cost']:.2%}")
-            c.metric("Option value", f"{result['option_value']:.2%}")
-            d.metric("Final coupon", f"{result['coupon_rate']:.2%}")
+            a.metric("Note PV @ funding cost", f"{result['note_pv']:,.2f}",
+                      help="Discounted PV of the note's cash flows if the coupon is set at 'Funding cost'. Below notional means that coupon is not sufficient to price the note to par; can be negative relative to par.")
+            b.metric("Funding cost (input)", f"{result['funding_cost']:.2%}")
+            c.metric("Option value (spread)", "N/A" if np.isnan(result['option_value']) else f"{result['option_value']:.2%}",
+                      help="Fair coupon minus funding cost. No longer floored at zero -- a negative value means the input funding cost already overpays relative to the embedded optionality.")
+            d.metric("Fair coupon (solves to par)", "N/A" if np.isnan(result['coupon_rate']) else f"{result['coupon_rate']:.2%}",
+                      help="The coupon rate at which Note PV would equal notional exactly, solved directly from the simulation.")
 
-            e, f = st.columns(2)
+            e, f, g = st.columns(3)
             e.metric("Call probability", f"{result['call_prob']:.2%}")
             f.metric("Expected call time", "N/A" if np.isnan(result['expected_call_time']) else f"{result['expected_call_time']:.2f}y")
+            g.metric("Discount rate used", f"{result['discount_rate']:.2%}")
 
             st.subheader("Confirmed market data")
             st.dataframe(edited, use_container_width=True, hide_index=True)
