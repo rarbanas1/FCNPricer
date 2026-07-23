@@ -7,11 +7,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from openpyxl import load_workbook
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Term-sheet-based FCN / autocallable pricer using Yahoo Finance inputs.")
+st.caption("Term-sheet-based FCN / autocallable pricer (Monte Carlo, worst-of payoff).")
 
 TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
 
@@ -131,7 +130,8 @@ def price_fcn(
     call_dates,
     coupon_dates,
     obs_months,
-    coupon_rate,
+    funding_cost,
+    option_value,
     notional,
     call_barrier,
     coupon_barrier,
@@ -139,6 +139,11 @@ def price_fcn(
     n_paths=20000,
     seed=11,
 ):
+    """
+    Structured-product decomposition:
+    final coupon = funding_cost + option_value.
+    Worst-of payoff is driven by the minimum performer across the underlying basket.
+    """
     maturity = max(year_frac(valuation_date, maturity_date), 0.01)
     steps = max(252, int(252 * maturity))
     paths = simulate_paths(spot, vol, div, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
@@ -156,6 +161,8 @@ def price_fcn(
     pv = np.zeros(n_paths)
     called = np.zeros(n_paths, dtype=bool)
     call_time_bucket = np.full(n_paths, np.nan)
+
+    coupon_rate = funding_cost + option_value
 
     for idx in call_idx:
         alive = ~called
@@ -182,12 +189,10 @@ def price_fcn(
     expected_call_time = float(np.nanmean(call_time_bucket)) if np.any(~np.isnan(call_time_bucket)) else float("nan")
     expected_payoff = float(pv.mean() / notional)
 
-    coupon_value = coupon_rate
-    option_value = max(0.0, 1.0 - expected_payoff)
-
     return {
         "note_pv": note_pv,
-        "coupon_value": coupon_value,
+        "coupon_rate": coupon_rate,
+        "funding_cost": funding_cost,
         "option_value": option_value,
         "call_prob": call_prob,
         "expected_call_time": expected_call_time,
@@ -195,96 +200,171 @@ def price_fcn(
     }
 
 
-with st.sidebar:
-    st.header("Inputs")
+def build_schedule(valuation_date, call_dates, coupon_dates, maturity_date):
+    sch_rows = [{"Type": "Valuation", "Date": str(valuation_date)}]
+    sch_rows += [{"Type": "Call", "Date": str(d)} for d in call_dates]
+    sch_rows += [{"Type": "Coupon", "Date": str(d)} for d in coupon_dates]
+    sch_rows += [{"Type": "Maturity", "Date": str(maturity_date)}]
+    return pd.DataFrame(sch_rows)
+
+
+def corr_long_df(corr_df):
+    out = corr_df.copy()
+    out.insert(0, "Underlying", out.index)
+    return out.reset_index(drop=True)
+
+
+st.markdown(
+    """
+<style>
+.block-container {
+    max-width: 1150px !important;
+    margin-left: auto;
+    margin-right: auto;
+    padding-top: 1.5rem;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.header("Inputs and assumptions")
+
+col1, col2 = st.columns([2, 1])
+with col1:
     n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
     tickers = []
+    default_tickers = ["C", "JPM", "BAC", "WFC"]
     for i in range(n_names):
-        tickers.append(st.text_input(f"Ticker {i+1}", value=["C", "JPM", "BAC", "WFC"][i]))
+        tickers.append(st.text_input(f"Ticker {i+1}", value=default_tickers[i]))
     valuation_date = st.date_input("Valuation date", value=date.today())
     maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
-    coupon_rate = st.number_input("Coupon rate", min_value=0.0, value=0.12, step=0.005, format="%.4f")
     notional = st.number_input("Notional", min_value=1.0, value=1000000.0, step=10000.0)
+
+with col2:
+    st.markdown("### Funding & option")
+    funding_cost = st.number_input(
+        "Funding cost (annual)", min_value=0.0, value=0.05, step=0.005, format="%.4f"
+    )
+    option_value = st.number_input(
+        "Option value (annual)", min_value=-1.0, value=0.07, step=0.005, format="%.4f"
+    )
+    st.caption("Final coupon = Funding cost + Option value.")
+
+c1, c2, c3 = st.columns(3)
+with c1:
     call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
     coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
+with c2:
     knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
     n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
+with c3:
     seed = st.number_input("Random seed", min_value=1, value=11, step=1)
-
-    st.subheader("Observation dates")
+    st.markdown("### Observation dates")
     obs_months = st.multiselect(
         "Months from valuation",
         options=list(range(1, 61)),
         default=[6, 12, 18],
     )
 
-try:
-    rows = []
-    for t in tickers:
-        spot = get_spot(t)
-        vol = get_iv_proxy(t)
-        div = get_dividend_yield(t)
-        rows.append({"Ticker": t, "Spot": spot, "Vol": vol, "Dividend Yield": div})
+calc_col1, calc_col2, calc_col3 = st.columns([1, 2, 1])
+with calc_col2:
+    calculate = st.button("Calculate", type="primary", use_container_width=True)
 
-    inp = pd.DataFrame(rows)
-    spot = inp["Spot"].tolist()
-    vol = inp["Vol"].tolist()
-    div = inp["Dividend Yield"].tolist()
+if not calculate:
+    st.info("Set inputs above and click Calculate to run the pricer.")
 
-    corr = hist_corr(tickers)
+if calculate:
+    try:
+        rows = []
+        for t in tickers:
+            spot = get_spot(t)
+            vol = get_iv_proxy(t)
+            div = get_dividend_yield(t)
+            rows.append({"Ticker": t, "Spot": spot, "Vol": vol, "Dividend Yield": div})
 
-    call_dates = [valuation_date + timedelta(days=int(30.4375 * m)) for m in obs_months]
-    coupon_dates = [maturity_date]
+        inp = pd.DataFrame(rows)
+        spot = inp["Spot"].tolist()
+        vol = inp["Vol"].tolist()
+        div = inp["Dividend Yield"].tolist()
 
-    result = price_fcn(
-        spot=spot,
-        vol=vol,
-        div=div,
-        corr=corr,
-        valuation_date=valuation_date,
-        maturity_date=maturity_date,
-        call_dates=call_dates,
-        coupon_dates=coupon_dates,
-        obs_months=obs_months,
-        coupon_rate=coupon_rate,
-        notional=notional,
-        call_barrier=call_barrier,
-        coupon_barrier=coupon_barrier,
-        knock_in_barrier=knock_in_barrier,
-        n_paths=int(n_paths),
-        seed=int(seed),
-    )
+        corr = hist_corr(tickers)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Note PV", f"{result['note_pv']:,.2f}")
-    c2.metric("Coupon value", f"{result['coupon_value']:.2%}")
-    c3.metric("Call probability", f"{result['call_prob']:.2%}")
-    c4.metric(
-        "Expected call time",
-        "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y",
-    )
+        call_dates = [valuation_date + timedelta(days=int(30.4375 * m)) for m in obs_months]
+        coupon_dates = [maturity_date]
 
-    st.subheader("Market inputs")
-    inp["Knock-in strike"] = inp["Spot"] * knock_in_barrier
-    inp["Coupon strike"] = inp["Spot"] * coupon_barrier
-    inp["Call strike"] = inp["Spot"] * call_barrier
-    st.dataframe(inp, use_container_width=True, hide_index=True)
+        result = price_fcn(
+            spot=spot,
+            vol=vol,
+            div=div,
+            corr=corr,
+            valuation_date=valuation_date,
+            maturity_date=maturity_date,
+            call_dates=call_dates,
+            coupon_dates=coupon_dates,
+            obs_months=obs_months,
+            funding_cost=funding_cost,
+            option_value=option_value,
+            notional=notional,
+            call_barrier=call_barrier,
+            coupon_barrier=coupon_barrier,
+            knock_in_barrier=knock_in_barrier,
+            n_paths=int(n_paths),
+            seed=int(seed),
+        )
 
-    st.subheader("Schedule")
-    sch_rows = [{"Type": "Valuation", "Date": str(valuation_date)}]
-    sch_rows += [{"Type": "Call", "Date": str(d)} for d in call_dates]
-    sch_rows += [{"Type": "Coupon", "Date": str(d)} for d in coupon_dates]
-    sch_rows += [{"Type": "Maturity", "Date": str(maturity_date)}]
-    st.dataframe(pd.DataFrame(sch_rows), use_container_width=True, hide_index=True)
+        st.subheader("Results")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Note PV", f"{result['note_pv']:,.2f}")
+        r2.metric("Funding cost", f"{result['funding_cost']:.2%}")
+        r3.metric("Option value", f"{result['option_value']:.2%}")
+        r4.metric("Final coupon", f"{result['coupon_rate']:.2%}")
 
-    st.subheader("Model notes")
-    st.write(
-        "The note is called if all underlyings are at or above the call barrier on an observation date. "
-        "If it is not called, maturity redemption depends on the worst performer versus the coupon and knock-in barriers."
-    )
+        r5, r6 = st.columns(2)
+        r5.metric("Call probability", f"{result['call_prob']:.2%}")
+        r6.metric(
+            "Expected call time",
+            "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y",
+        )
 
-    csv = inp.to_csv(index=False).encode("utf-8")
-    st.download_button("Download inputs CSV", csv, file_name="fcn_pricing_inputs.csv", mime="text/csv")
+        st.subheader("Underlying details")
+        inp["Vol"] = inp["Vol"].map(lambda x: f"{x:.2%}")
+        inp["Dividend Yield"] = inp["Dividend Yield"].map(lambda x: f"{x:.2%}")
+        inp["Knock-in strike"] = [f"{s * knock_in_barrier:,.4f}" for s in spot]
+        inp["Coupon strike"] = [f"{s * coupon_barrier:,.4f}" for s in spot]
+        inp["Call strike"] = [f"{s * call_barrier:,.4f}" for s in spot]
+        st.dataframe(inp, use_container_width=True, hide_index=True)
 
-except Exception as e:
-    st.error(str(e))
+        st.subheader("Correlation matrix")
+        st.dataframe(corr.round(4), use_container_width=True)
+        st.dataframe(corr_long_df(corr).round(4), use_container_width=True, hide_index=True)
+
+        st.subheader("Schedule")
+        st.dataframe(
+            build_schedule(valuation_date, call_dates, coupon_dates, maturity_date),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Model notes and references")
+        st.write(
+            "This pricer models the structured note as a financing leg plus a derivative leg, "
+            "with final coupon = funding_cost + option_value. "
+            "The payoff is worst-of: the minimum performance across the selected underlyings drives the call and maturity outcomes. "
+            "Dividend yield, volatility and correlation are material inputs to worst-of pricing and risk."
+        )
+        st.markdown(
+            "- [The Interplay between Stochastic Volatility and Correlations in Equity Autocallables](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3228065)"
+        )
+        st.markdown(
+            "- [Risk misperceptions of structured financial products with worst-of payout characteristics revisited](https://www.econstor.eu/bitstream/10419/248602/1/DP1143R.pdf)"
+        )
+        st.markdown(
+            "- [A Bayesian view on autocallable pricing and risk management](https://sussex.figshare.com/articles/journal_contribution/A_Bayesian_view_on_autocallable_pricing_and_risk_management/23491451)"
+        )
+
+        csv = inp.to_csv(index=False).encode("utf-8")
+        st.download_button("Download inputs CSV", csv, file_name="fcn_pricing_inputs.csv", mime="text/csv")
+
+    except Exception as e:
+        st.error(str(e))
