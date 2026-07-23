@@ -1,28 +1,28 @@
 
 import math
-from datetime import date, datetime, timedelta
-from pathlib import Path
+import os
 import re
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
-import requests
-from bs4 import BeautifulSoup
+
+# =========================
+# API KEYS: EDIT THESE TWO LINES
+# =========================
+ALPHAVANTAGE_API_KEY = "PT0LGXXYRI62PO7B"
+FINNHUB_API_KEY = "d8cguj1r01qidic7thjgd8cguj1r01qidic7thk0"
+# =========================
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
 st.caption("Worst-of FCN / autocallable pricer with a two-step market data confirmation flow.")
 
-TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+ALPHAV_URL = "https://www.alphavantage.co/query"
+FINNHUB_URL = "https://finnhub.io/api/v1"
 
 
 def to_date(x):
@@ -37,124 +37,173 @@ def year_frac(d1, d2):
     return (to_date(d2) - to_date(d1)).days / 365.0
 
 
-def get_spot_yf(ticker: str) -> float:
+def yf_spot(ticker: str) -> float:
     hist = yf.Ticker(ticker).history(period="10d", auto_adjust=False)
     if hist.empty:
         raise ValueError(f"No price data for {ticker}")
     return float(hist["Close"].dropna().iloc[-1])
 
 
-def fetch_page(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=20)
+def alpha_vantage_spot(ticker: str) -> float:
+    params = {
+        "function": "GLOBAL_QUOTE",
+        "symbol": ticker,
+        "apikey": ALPHAVANTAGE_API_KEY,
+    }
+    r = requests.get(ALPHAV_URL, params=params, timeout=20)
     r.raise_for_status()
-    return r.text
+    data = r.json()
+    q = data.get("Global Quote", {})
+    price = q.get("05. price")
+    if price is None:
+        raise ValueError(f"Alpha Vantage spot unavailable for {ticker}")
+    return float(price)
 
 
-def mc_url(ticker: str, kind: str) -> str:
+def alpha_vantage_dividend_yield(ticker: str):
+    params = {
+        "function": "OVERVIEW",
+        "symbol": ticker,
+        "apikey": ALPHAVANTAGE_API_KEY,
+    }
+    r = requests.get(ALPHAV_URL, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if not data or "DividendYield" not in data:
+        raise ValueError(f"Alpha Vantage overview unavailable for {ticker}")
+    dy = data.get("DividendYield")
+    if dy in (None, "", "None"):
+        raise ValueError(f"DividendYield missing for {ticker}")
+    return float(dy)
+
+
+def alpha_vantage_iv(ticker: str, as_of: str | None = None):
+    # Best-effort: Alpha Vantage historical options chain endpoint availability depends on account/features.
+    # This block tries a documented-style query pattern and then falls back to a local estimate if needed.
+    candidates = []
+    if as_of:
+        candidates.append(
+            {
+                "function": "HISTORICAL_OPTIONS",
+                "symbol": ticker,
+                "date": as_of,
+                "apikey": ALPHAVANTAGE_API_KEY,
+            }
+        )
+    candidates.append(
+        {
+            "function": "HISTORICAL_OPTIONS",
+            "symbol": ticker,
+            "apikey": ALPHAVANTAGE_API_KEY,
+        }
+    )
+
+    for params in candidates:
+        try:
+            r = requests.get(ALPHAV_URL, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                for key in data.keys():
+                    if isinstance(data[key], list) and data[key]:
+                        rows = data[key]
+                        ivs = []
+                        for row in rows:
+                            for iv_key in ("impliedVolatility", "iv", "implied_volatility"):
+                                if iv_key in row and row[iv_key] not in (None, "", "None"):
+                                    try:
+                                        ivs.append(float(row[iv_key]))
+                                        break
+                                    except Exception:
+                                        pass
+                        if ivs:
+                            iv = float(np.nanmedian(ivs))
+                            return iv / 100.0 if iv > 5 else iv
+        except Exception:
+            pass
+
+    raise ValueError(f"Alpha Vantage IV unavailable for {ticker}")
+
+
+def finnhub_quote(ticker: str):
+    url = f"{FINNHUB_URL}/quote"
+    params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def finnhub_profile2(ticker: str):
+    url = f"{FINNHUB_URL}/stock/profile2"
+    params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def finnhub_dividend_yield(ticker: str):
+    prof = finnhub_profile2(ticker)
+    for k in ("dividendYield", "dividend_yield"):
+        if k in prof and prof[k] not in (None, "", "None"):
+            return float(prof[k])
+    raise ValueError(f"Finnhub dividend yield unavailable for {ticker}")
+
+
+def finnhub_spot(ticker: str):
+    q = finnhub_quote(ticker)
+    c = q.get("c")
+    if c is None:
+        raise ValueError(f"Finnhub spot unavailable for {ticker}")
+    return float(c)
+
+
+def fetch_market_data(ticker: str):
     ticker = ticker.upper().strip()
-    if kind == "iv":
-        return f"https://marketchameleon.com/Overview/{ticker}/IV/"
-    if kind == "div":
-        return f"https://marketchameleon.com/Overview/{ticker}/Dividends/"
-    if kind == "summary":
-        return f"https://marketchameleon.com/Overview/{ticker}/Summary/"
-    raise ValueError(kind)
+    row = {"Ticker": ticker, "Spot": np.nan, "Vol": np.nan, "Dividend Yield": np.nan}
+    status = {"Ticker": ticker, "Spot Source": "manual", "IV Source": "manual", "Div Source": "manual"}
 
-
-def first_float(patterns, text):
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.I | re.S)
-        if m:
-            raw = m.group(1).replace(",", "").strip()
+    # Spot: prefer Finnhub, fallback Alpha Vantage, fallback Yahoo
+    try:
+        row["Spot"] = finnhub_spot(ticker)
+        status["Spot Source"] = "Finnhub"
+    except Exception:
+        try:
+            row["Spot"] = alpha_vantage_spot(ticker)
+            status["Spot Source"] = "Alpha Vantage"
+        except Exception:
             try:
-                return float(raw)
+                row["Spot"] = yf_spot(ticker)
+                status["Spot Source"] = "yfinance"
             except Exception:
                 pass
-    return None
 
-
-def parse_mc_iv(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    txt = soup.get_text(" ", strip=True)
-    val = first_float(
-        [
-            r"implied volatility\s*\\(IV\\)\s*is\s*([0-9]+(?:\.[0-9]+)?)",
-            r"implied volatility[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-            r"\bIV\b[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-        ],
-        txt,
-    )
-    if val is None:
-        raise ValueError("IV not found")
-    return val / 100.0 if val > 5 else val
-
-
-def parse_mc_div(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    txt = soup.get_text(" ", strip=True)
-    val = first_float(
-        [
-            r"Forward Dividend Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
-            r"Dividend Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
-            r"Div Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
-            r"Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
-        ],
-        txt,
-    )
-    if val is None:
-        raise ValueError("Dividend yield not found")
-    return val / 100.0
-
-
-def parse_mc_spot(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    txt = soup.get_text(" ", strip=True)
-    val = first_float(
-        [
-            r"Today\s+[+\-]?[0-9.]+\s+([0-9]+(?:\.[0-9]+)?)",
-            r"Last Price\s*([0-9]+(?:\.[0-9]+)?)",
-            r"price quote[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-        ],
-        txt,
-    )
-    if val is None:
-        raise ValueError("Spot not found")
-    return val
-
-
-def load_market_data(ticker: str):
-    ticker = ticker.upper().strip()
-    out = {"Ticker": ticker, "Spot": np.nan, "Vol": np.nan, "Dividend Yield": np.nan}
-    status = {"Spot Source": "manual", "IV Source": "manual", "Div Source": "manual"}
-
+    # Dividend yield: prefer Finnhub, fallback Alpha Vantage
     try:
-        out["Spot"] = get_spot_yf(ticker)
+        row["Dividend Yield"] = finnhub_dividend_yield(ticker)
+        status["Div Source"] = "Finnhub"
     except Exception:
-        pass
+        try:
+            row["Dividend Yield"] = alpha_vantage_dividend_yield(ticker)
+            status["Div Source"] = "Alpha Vantage"
+        except Exception:
+            pass
 
+    # IV: prefer Alpha Vantage historical options, fallback local estimate from yfinance history if needed
     try:
-        iv_html = fetch_page(mc_url(ticker, "iv"))
-        out["Vol"] = parse_mc_iv(iv_html)
-        status["IV Source"] = "Market Chameleon"
+        row["Vol"] = alpha_vantage_iv(ticker)
+        status["IV Source"] = "Alpha Vantage"
     except Exception:
-        pass
+        try:
+            hist = yf.Ticker(ticker).history(period="1y", auto_adjust=False)
+            if not hist.empty:
+                r = np.log(hist["Close"].dropna()).diff().dropna()
+                if not r.empty:
+                    row["Vol"] = float(max(0.05, min(2.0, r.std() * np.sqrt(252))))
+                    status["IV Source"] = "yfinance estimate"
+        except Exception:
+            pass
 
-    try:
-        div_html = fetch_page(mc_url(ticker, "div"))
-        out["Dividend Yield"] = parse_mc_div(div_html)
-        status["Div Source"] = "Market Chameleon"
-    except Exception:
-        pass
-
-    try:
-        summary_html = fetch_page(mc_url(ticker, "summary"))
-        spot_mc = parse_mc_spot(summary_html)
-        out["Spot"] = spot_mc
-        status["Spot Source"] = "Market Chameleon"
-    except Exception:
-        pass
-
-    return out, status
+    return row, status
 
 
 def hist_corr(tickers):
@@ -171,8 +220,7 @@ def hist_corr(tickers):
     ret = np.log(df).diff().dropna()
     corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
     corr = corr.to_numpy(copy=True)
-    if corr.size:
-        np.fill_diagonal(corr, 1.0)
+    np.fill_diagonal(corr, 1.0)
     return pd.DataFrame(corr, index=tickers, columns=tickers)
 
 
@@ -187,14 +235,13 @@ def cholesky_with_fallback(corr):
         return np.linalg.cholesky(corr2)
 
 
-def simulate_paths(spot, vol, div, corr, maturity, n_paths=20000, steps=252, seed=11):
+def simulate_paths(spot, vol, div, corr, maturity, n_paths=12000, steps=252, seed=11):
     rng = np.random.default_rng(seed)
     n = len(spot)
     dt = maturity / steps
     chol = cholesky_with_fallback(corr)
     paths = np.zeros((n_paths, steps + 1, n), dtype=float)
     paths[:, 0, :] = spot
-
     drift = np.array([(0.0 - d - 0.5 * v * v) for d, v in zip(div, vol)], dtype=float)
     diff = np.array(vol, dtype=float)
 
@@ -202,13 +249,12 @@ def simulate_paths(spot, vol, div, corr, maturity, n_paths=20000, steps=252, see
         z = rng.standard_normal((n_paths, n))
         zc = z @ chol.T
         for i in range(n):
-            paths[:, t, i] = paths[:, t - 1, i] * np.exp((drift[i] * dt) + diff[i] * math.sqrt(dt) * zc[:, i])
+            paths[:, t, i] = paths[:, t - 1, i] * np.exp(drift[i] * dt + diff[i] * math.sqrt(dt) * zc[:, i])
     return paths
 
 
 def worst_of_ratio(paths, spot):
-    rel = paths / np.array(spot)[None, None, :]
-    return rel.min(axis=2)
+    return (paths / np.array(spot)[None, None, :]).min(axis=2)
 
 
 def price_fcn(
@@ -224,7 +270,7 @@ def price_fcn(
     call_barrier,
     coupon_barrier,
     knock_in_barrier,
-    n_paths=20000,
+    n_paths=12000,
     seed=11,
 ):
     maturity = max(year_frac(valuation_date, maturity_date), 0.01)
@@ -233,10 +279,9 @@ def price_fcn(
 
     obs_times = [year_frac(valuation_date, valuation_date + timedelta(days=int(30.4375 * m))) for m in obs_months]
     obs_idx = [min(steps, max(1, int(round(t / maturity * steps)))) for t in obs_times]
-    maturity_idx = steps
 
-    worst_call = worst_of_ratio(paths, spot)
-    worst_maturity = worst_call[:, maturity_idx]
+    worst = worst_of_ratio(paths, spot)
+    terminal = worst[:, -1]
 
     pv = np.zeros(n_paths)
     called = np.zeros(n_paths, dtype=bool)
@@ -244,47 +289,37 @@ def price_fcn(
 
     for idx in obs_idx:
         alive = ~called
-        trigger = alive & (worst_call[:, idx] >= call_barrier)
+        trigger = alive & (worst[:, idx] >= call_barrier)
         if np.any(trigger):
             t = idx / steps * maturity
-            principal = notional
-            coupon = notional * funding_cost * t
-            pv[trigger] += principal + coupon
+            cash = notional + notional * funding_cost * t
+            pv[trigger] += cash
             called[trigger] = True
             call_time_bucket[trigger] = t
 
     alive = ~called
     if np.any(alive):
-        terminal = worst_maturity[alive]
-        t = maturity
-        coupon = notional * funding_cost * t
+        coupon = notional * funding_cost * maturity
         redemption = np.where(
-            terminal >= coupon_barrier,
+            terminal[alive] >= coupon_barrier,
             notional + coupon,
-            np.where(
-                terminal >= knock_in_barrier,
-                notional + coupon,
-                notional * terminal,
-            ),
+            np.where(terminal[alive] >= knock_in_barrier, notional + coupon, notional * terminal[alive]),
         )
         pv[alive] += redemption
 
     note_pv = pv.mean()
     call_prob = float(np.mean(called))
     expected_call_time = float(np.nanmean(call_time_bucket)) if np.any(~np.isnan(call_time_bucket)) else float("nan")
-    expected_payoff = float(pv.mean() / notional)
-
-    raw_option_value = max(0.0, float((note_pv / notional) - 1.0))
-    coupon_rate = funding_cost + raw_option_value
+    option_value = max(0.0, float(note_pv / notional - 1.0))
+    coupon_rate = funding_cost + option_value
 
     return {
         "note_pv": note_pv,
         "coupon_rate": coupon_rate,
         "funding_cost": funding_cost,
-        "option_value": raw_option_value,
+        "option_value": option_value,
         "call_prob": call_prob,
         "expected_call_time": expected_call_time,
-        "expected_payoff": expected_payoff,
     }
 
 
@@ -318,12 +353,7 @@ def corr_long_df(corr_df):
 st.markdown(
     """
 <style>
-.block-container {
-    max-width: 1200px !important;
-    margin-left: auto;
-    margin-right: auto;
-    padding-top: 1.25rem;
-}
+.block-container { max-width: 1200px !important; margin-left: auto; margin-right: auto; padding-top: 1.25rem; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -342,45 +372,36 @@ col1, col2 = st.columns([2, 1])
 with col1:
     n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
     default_tickers = ["DRAM", "SOXX", "FXI", "XLK"]
-    tickers = []
-    for i in range(n_names):
-        tickers.append(st.text_input(f"Ticker {i+1}", value=default_tickers[i], key=f"ticker_{i}"))
+    tickers = [st.text_input(f"Ticker {i+1}", value=default_tickers[i]) for i in range(n_names)]
     valuation_date = st.date_input("Valuation date", value=date.today())
     maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
     notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
-
 with col2:
     st.markdown("### Funding")
     funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f")
-    st.caption("Funding cost is an issuer input. Market data is confirmed in step two before calculation.")
 
 c1, c2, c3 = st.columns(3)
 with c1:
     call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
-    st.caption("If the worst-performing underlying is at or above this level on an observation date, the note can autocall.")
     coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
-    st.caption("If the worst-performing underlying stays at or above this level, the coupon condition is met.")
 with c2:
     knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
-    st.caption("If the worst-performing underlying falls below this level, downside principal exposure is activated.")
     n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
 with c3:
     seed = st.number_input("Random seed", min_value=1, value=11, step=1)
-    st.markdown("### Observation dates")
     obs_months = st.multiselect("Months from valuation", options=list(range(1, 61)), default=[6])
 
 st.markdown("### Step 1")
 st.write("Enter the product terms above.")
 
 if st.button("Load / Confirm market data", type="primary", use_container_width=True):
-    rows = []
-    stat_rows = []
+    rows, stats = [], []
     for t in tickers:
-        md, stt = load_market_data(t)
+        md, stt = fetch_market_data(t)
         rows.append(md)
-        stat_rows.append({"Ticker": t.upper().strip(), **stt})
+        stats.append(stt)
     st.session_state.market_df = pd.DataFrame(rows)
-    st.session_state.status_df = pd.DataFrame(stat_rows)
+    st.session_state.status_df = pd.DataFrame(stats)
     st.session_state.step = 2
 
 if st.session_state.step >= 2 and st.session_state.market_df is not None:
@@ -390,19 +411,16 @@ if st.session_state.step >= 2 and st.session_state.market_df is not None:
         st.dataframe(st.session_state.status_df, use_container_width=True, hide_index=True)
 
     editor_df = st.session_state.market_df.copy()
-    editor_df["Spot"] = pd.to_numeric(editor_df["Spot"], errors="coerce")
-    editor_df["Vol"] = pd.to_numeric(editor_df["Vol"], errors="coerce")
-    editor_df["Dividend Yield"] = pd.to_numeric(editor_df["Dividend Yield"], errors="coerce")
-
     edited = st.data_editor(
         editor_df,
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "Spot": st.column_config.NumberColumn("Spot", help="Market spot price"),
+            "Spot": st.column_config.NumberColumn("Spot"),
             "Vol": st.column_config.NumberColumn("Implied Vol", help="Decimal form, e.g. 0.615 = 61.5%"),
             "Dividend Yield": st.column_config.NumberColumn("Dividend Yield", help="Decimal form, e.g. 0.002 = 0.2%"),
         },
+        key="market_editor",
     )
 
     if st.button("Calculate", type="primary", use_container_width=True):
@@ -447,8 +465,7 @@ if st.session_state.step >= 2 and st.session_state.market_df is not None:
             r6.metric("Expected call time", "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y")
 
             st.subheader("Underlying details")
-            underlying_df = format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier)
-            st.dataframe(underlying_df, use_container_width=True, hide_index=True)
+            st.dataframe(format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier), use_container_width=True, hide_index=True)
 
             st.subheader("Correlation matrix")
             st.dataframe(corr.round(4), use_container_width=True)
@@ -456,14 +473,6 @@ if st.session_state.step >= 2 and st.session_state.market_df is not None:
 
             st.subheader("Schedule")
             st.dataframe(build_schedule(valuation_date, obs_months, maturity_date), use_container_width=True, hide_index=True)
-
-            st.subheader("Model notes and references")
-            st.write(
-                "This app uses Market Chameleon market data when available, with editable fallbacks in step two. "
-                "The pricing engine uses the basket's worst-of dynamics."
-            )
-            st.markdown("- [Market Chameleon](https://marketchameleon.com/)")
-            st.markdown("- [Streamlit data editor docs](https://docs.streamlit.io/develop/api-reference/data/st.data_editor)")
 
         except Exception as e:
             st.error(str(e))
