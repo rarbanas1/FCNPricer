@@ -390,18 +390,28 @@ def price_fcn(spot, vol, div, corr, r, valuation_date, maturity_date, obs_months
     alive = ~called
     df_T = math.exp(-r * maturity)
     if np.any(alive):
-        # Knock-in barrier gates protection. If knock_in_barrier < coupon_barrier,
-        # the zone between them is a cushion: still fully protected (par + coupon)
-        # even though the worst performer is already below the strike.
+        # This is a Fixed Coupon Note: the coupon is a guaranteed cash flow on
+        # any path that reaches maturity without being called, like a bond
+        # coupon. ONLY the principal redemption is barrier-contingent (par vs.
+        # worst-of delivery at the strike). The coupon must NOT be zeroed out
+        # on breach paths -- doing so (as the original code did) understates
+        # the "always paid" coupon base by roughly the breach probability,
+        # which inflates the solved fair coupon by a large, spurious amount.
+        B[alive] += notional * maturity * df_T
+
+        # Knock-in barrier gates PRINCIPAL protection only. If
+        # knock_in_barrier < coupon_barrier, the zone between them is a
+        # cushion: principal still comes back at par even though the worst
+        # performer is already below the strike.
         safe = alive & (terminal >= knock_in_barrier)
         breach = alive & (terminal < knock_in_barrier)
 
         A[safe] += notional * df_T
-        B[safe] += notional * maturity * df_T
 
         # Below knock-in, the embedded put (struck at coupon_barrier) is live:
-        # redemption reflects the worst performer's level relative to the
-        # strike, not relative to 100% spot. No coupon accrues on these paths.
+        # principal redemption reflects the worst performer's level relative
+        # to the strike, not relative to 100% spot. The coupon above is still
+        # paid on these paths.
         A[breach] += notional * (terminal[breach] / coupon_barrier) * df_T
 
     A_bar = float(A.mean())
