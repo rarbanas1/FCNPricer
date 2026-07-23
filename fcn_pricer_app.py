@@ -10,7 +10,7 @@ import yfinance as yf
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Term-sheet-based FCN / autocallable pricer (Monte Carlo, worst-of payoff).")
+st.caption("Worst-of FCN / autocallable pricer with implied vol and current dividend yield.")
 
 TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
 
@@ -34,34 +34,53 @@ def get_spot(ticker: str) -> float:
     return float(hist["Close"].dropna().iloc[-1])
 
 
-def get_iv_proxy(ticker: str) -> float:
+def get_implied_vol(ticker: str) -> float:
     t = yf.Ticker(ticker)
+    expiries = []
     try:
         expiries = list(t.options or [])
     except Exception:
         expiries = []
-    for exp in expiries[:2]:
+
+    for exp in expiries[:3]:
         try:
-            chain = t.option_chain(exp).puts
-            if not chain.empty and "impliedVolatility" in chain.columns:
-                iv = float(chain["impliedVolatility"].dropna().median())
-                if 0 < iv < 5:
-                    return iv
+            chain = t.option_chain(exp)
+            calls = chain.calls.copy()
+            puts = chain.puts.copy()
+            if calls.empty or puts.empty:
+                continue
+
+            for df in (calls, puts):
+                if "impliedVolatility" in df.columns:
+                    df["moneyness"] = (df["strike"] / df["strike"].median()).abs()
+                    near_atm = df.sort_values("moneyness").head(8)
+                    iv = pd.to_numeric(near_atm["impliedVolatility"], errors="coerce").dropna()
+                    if not iv.empty:
+                        v = float(iv.median())
+                        if 0.01 <= v <= 5.0:
+                            return v
         except Exception:
             pass
+
     hist = t.history(period="1y", auto_adjust=False)
     if hist.empty:
         return 0.30
     r = np.log(hist["Close"].dropna()).diff().dropna()
     if r.empty:
         return 0.30
-    return float(r.std() * np.sqrt(252))
+    return float(max(0.05, min(2.0, r.std() * np.sqrt(252))))
 
 
 def get_dividend_yield(ticker: str) -> float:
     try:
         info = yf.Ticker(ticker).info or {}
-        return float(info.get("dividendYield") or 0.0)
+        dy = info.get("dividendYield")
+        if dy is None:
+            return 0.0
+        dy = float(dy)
+        if not np.isfinite(dy) or dy < 0:
+            return 0.0
+        return dy
     except Exception:
         return 0.0
 
@@ -135,6 +154,7 @@ def price_fcn(
     call_barrier,
     coupon_barrier,
     knock_in_barrier,
+    coupon_per_obs=0.01,
     n_paths=20000,
     seed=11,
 ):
@@ -163,26 +183,26 @@ def price_fcn(
         trigger = alive & (worst_call[:, idx] >= call_barrier)
         if np.any(trigger):
             t = idx / steps * maturity
+            coupon_cashflow = notional * coupon_per_obs * max(1.0, round(t / (maturity / max(len(call_idx), 1)), 6))
+            note_cashflow = (notional + coupon_cashflow) * dfs[idx]
             principal_pv = notional * dfs[idx]
-            coupon_support_pv = notional * funding_cost * t * dfs[idx]
-            note_cashflow = (notional + coupon_support_pv) * dfs[idx]
+            coupon_support_pv = coupon_cashflow * dfs[idx]
             pv[trigger] += note_cashflow
-            option_leg_pv[trigger] += max(0.0, note_cashflow - principal_pv - coupon_support_pv)
+            option_leg_pv[trigger] += np.maximum(0.0, note_cashflow - principal_pv - coupon_support_pv)
             called[trigger] = True
             call_time_bucket[trigger] = t
 
     alive = ~called
     if np.any(alive):
         terminal = worst_maturity[alive]
-        t = maturity
-        coupon_support_pv = notional * funding_cost * t * dfs[maturity_idx]
+        coupon_cashflow = notional * coupon_per_obs * maturity * dfs[maturity_idx]
 
         redemption = np.where(
             terminal >= coupon_barrier,
-            notional + coupon_support_pv,
+            notional + coupon_cashflow,
             np.where(
                 terminal >= knock_in_barrier,
-                notional + coupon_support_pv,
+                notional + coupon_cashflow,
                 notional * terminal,
             ),
         )
@@ -190,7 +210,7 @@ def price_fcn(
         redemption_pv = redemption * dfs[maturity_idx]
         pv[alive] += redemption_pv
 
-        raw_option_pv = redemption_pv - notional * dfs[maturity_idx] - coupon_support_pv
+        raw_option_pv = redemption_pv - notional * dfs[maturity_idx] - coupon_cashflow
         option_leg_pv[alive] += np.maximum(0.0, raw_option_pv)
 
     note_pv = pv.mean()
@@ -228,8 +248,8 @@ def format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier)
     out["Knock-in strike"] = out["Spot"] * knock_in_barrier
     out["Coupon strike"] = out["Spot"] * coupon_barrier
     out["Call strike"] = out["Spot"] * call_barrier
-    out["Vol"] = out["Vol"].map(lambda x: f"{x:.2%}")
-    out["Dividend Yield"] = out["Dividend Yield"].map(lambda x: f"{x:.2%}")
+    out["Implied Vol"] = out["Vol"].map(lambda x: f"{x:.2%}")
+    out["Current Dividend Yield"] = out["Dividend Yield"].map(lambda x: f"{x:.2%}")
     return out
 
 
@@ -259,17 +279,17 @@ col1, col2 = st.columns([2, 1])
 with col1:
     n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
     tickers = []
-    default_tickers = ["C", "JPM", "BAC", "WFC"]
+    default_tickers = ["DRAM", "SOXX", "FXI", "XLK"]
     for i in range(n_names):
         tickers.append(st.text_input(f"Ticker {i+1}", value=default_tickers[i]))
     valuation_date = st.date_input("Valuation date", value=date.today())
     maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
-    notional = st.number_input("Notional", min_value=1.0, value=1000000.0, step=10000.0)
+    notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
 
 with col2:
     st.markdown("### Funding")
     funding_cost = st.number_input(
-        "Funding cost (annual)", min_value=0.0, value=0.05, step=0.005, format="%.4f"
+        "Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f"
     )
     st.caption("Funding cost is an issuer input. The option leg is priced from the worst-of FCN payoff and added to funding cost to set the coupon.")
 
@@ -277,10 +297,10 @@ c1, c2, c3 = st.columns(3)
 with c1:
     call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
     st.caption("If the worst-performing underlying is at or above this level on an observation date, the note can autocall.")
-    coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
+    coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
     st.caption("If the worst-performing underlying stays at or above this level, the coupon condition is met.")
 with c2:
-    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.6, step=0.01, format="%.4f")
+    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
     st.caption("If the worst-performing underlying falls below this level, downside principal exposure is activated.")
     n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
 with c3:
@@ -289,7 +309,7 @@ with c3:
     obs_months = st.multiselect(
         "Months from valuation",
         options=list(range(1, 61)),
-        default=[6, 12, 18],
+        default=[6],
     )
 
 calc_col1, calc_col2, calc_col3 = st.columns([1, 2, 1])
@@ -304,9 +324,9 @@ if calculate:
         rows = []
         for t in tickers:
             spot = get_spot(t)
-            vol = get_iv_proxy(t)
+            iv = get_implied_vol(t)
             div = get_dividend_yield(t)
-            rows.append({"Ticker": t, "Spot": spot, "Vol": vol, "Dividend Yield": div})
+            rows.append({"Ticker": t, "Spot": spot, "Vol": iv, "Dividend Yield": div})
 
         inp = pd.DataFrame(rows)
         spot = inp["Spot"].tolist()
@@ -371,13 +391,13 @@ if calculate:
             "This pricer models the structured note as a financing leg plus a derivative leg, "
             "with final coupon = funding_cost + option_value. "
             "The payoff is worst-of: the minimum performance across the selected underlyings drives the call and maturity outcomes. "
-            "Dividend yield, volatility and correlation are material inputs to worst-of pricing and risk."
+            "Dividend yield and implied volatility are market inputs, and correlation is material to the worst-of pricing."
         )
         st.markdown(
             "- [The Interplay between Stochastic Volatility and Correlations in Equity Autocallables](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3228065)"
         )
         st.markdown(
-            "- [Risk misperceptions of structured financial products with worst-of payout characteristics revisited](https://www.econstor.eu/bitstream/10419/248602/1/DP1143R.pdf)"
+            "- [Pricing autocallables under local-stochastic volatility](https://www.aimsciences.org/article/doi/10.3934/fmf.2022008)"
         )
         st.markdown(
             "- [A Bayesian view on autocallable pricing and risk management](https://sussex.figshare.com/articles/journal_contribution/A_Bayesian_view_on_autocallable_pricing_and_risk_management/23491451)"
