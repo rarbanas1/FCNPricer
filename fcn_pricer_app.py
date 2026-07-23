@@ -69,6 +69,19 @@ def finnhub_spot(ticker: str) -> float:
     return float(data["c"])
 
 
+def _first_numeric(*values):
+    for v in values:
+        if v in (None, "", "None"):
+            continue
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        if np.isfinite(x):
+            return x
+    return None
+
+
 def alpha_dividend_yield(ticker: str):
     r = requests.get(
         ALPHAV_URL,
@@ -127,6 +140,51 @@ def finnhub_trailing_dividend_yield(ticker: str):
     return total / px
 
 
+def yfinance_dividend_yield(ticker: str):
+    info = yf.Ticker(ticker).info or {}
+    dy = _first_numeric(
+        info.get("trailingAnnualDividendYield"),
+        info.get("yield"),
+        info.get("dividendYield"),
+    )
+    if dy is None:
+        raise ValueError("yfinance dividend yield unavailable")
+    return dy
+
+
+def dividend_yield_from_history(ticker: str):
+    ticker_obj = yf.Ticker(ticker)
+    hist = ticker_obj.history(period="2y", auto_adjust=False)
+    if hist.empty or "Dividends" not in hist.columns:
+        raise ValueError("Dividend history unavailable")
+    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=365)
+    divs = hist["Dividends"].copy()
+    divs.index = pd.to_datetime(divs.index)
+    total = float(divs[divs.index >= cutoff].fillna(0.0).sum())
+    if total <= 0:
+        raise ValueError("No trailing dividends found")
+    px = float(hist["Close"].dropna().iloc[-1])
+    if px <= 0:
+        raise ValueError("Invalid spot for dividend yield calc")
+    return total / px
+
+
+def dividend_yield_loader(ticker: str):
+    ticker = ticker.upper().strip()
+    errors = []
+    for name, fn in [
+        ("Finnhub", lambda: finnhub_dividend_yield_from_profile(ticker)),
+        ("Alpha Vantage", lambda: alpha_dividend_yield(ticker)),
+        ("yfinance info", lambda: yfinance_dividend_yield(ticker)),
+        ("yfinance history", lambda: dividend_yield_from_history(ticker)),
+    ]:
+        try:
+            return fn(), name
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    raise ValueError("Dividend yield unavailable after fallbacks: " + " | ".join(errors))
+
+
 def alpha_iv_from_history(ticker: str):
     # Best effort: use historical options if available; otherwise fall back to realized-vol estimate.
     for params in [
@@ -173,6 +231,10 @@ def fetch_candidates(ticker: str):
         "Div - Finnhub profile": np.nan,
         "Div - Finnhub trailing": np.nan,
         "Div - Alpha Vantage": np.nan,
+        "Div - yfinance info": np.nan,
+        "Div - yfinance history": np.nan,
+        "Div - Loader": np.nan,
+        "Div - Source": "",
     }
     try:
         cand["Spot - Finnhub"] = finnhub_spot(ticker)
@@ -200,6 +262,20 @@ def fetch_candidates(ticker: str):
         pass
     try:
         cand["Div - Alpha Vantage"] = alpha_dividend_yield(ticker)
+    except Exception:
+        pass
+    try:
+        cand["Div - yfinance info"] = yfinance_dividend_yield(ticker)
+    except Exception:
+        pass
+    try:
+        cand["Div - yfinance history"] = dividend_yield_from_history(ticker)
+    except Exception:
+        pass
+    try:
+        dy, src = dividend_yield_loader(ticker)
+        cand["Div - Loader"] = dy
+        cand["Div - Source"] = src
     except Exception:
         pass
     return cand
@@ -384,14 +460,27 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
         )
         div_source = st.selectbox(
             f"{t} dividend source",
-            ["Finnhub profile", "Finnhub trailing", "Alpha Vantage", "Manual"],
-            index=0,
+            ["Finnhub profile", "Finnhub trailing", "Alpha Vantage", "yfinance info", "yfinance history", "Auto", "Manual"],
+            index=5,
             key=f"div_src_{i}",
         )
 
         spot_val = row.get("Spot - Finnhub") if spot_source == "Finnhub" else row.get("Spot - Alpha Vantage") if spot_source == "Alpha Vantage" else row.get("Spot - yfinance")
         iv_val = row.get("IV - Alpha Vantage") if iv_source == "Alpha Vantage" else np.nan
-        div_val = row.get("Div - Finnhub profile") if div_source == "Finnhub profile" else row.get("Div - Finnhub trailing") if div_source == "Finnhub trailing" else row.get("Div - Alpha Vantage") if div_source == "Alpha Vantage" else np.nan
+        if div_source == "Finnhub profile":
+            div_val = row.get("Div - Finnhub profile")
+        elif div_source == "Finnhub trailing":
+            div_val = row.get("Div - Finnhub trailing")
+        elif div_source == "Alpha Vantage":
+            div_val = row.get("Div - Alpha Vantage")
+        elif div_source == "yfinance info":
+            div_val = row.get("Div - yfinance info")
+        elif div_source == "yfinance history":
+            div_val = row.get("Div - yfinance history")
+        elif div_source == "Auto":
+            div_val = row.get("Div - Loader")
+        else:
+            div_val = np.nan
 
         selected_rows.append(
             {
@@ -448,7 +537,7 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
 
             e, f = st.columns(2)
             e.metric("Call probability", f"{result['call_prob']:.2%}")
-            f.metric("Expected call time", "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y")
+            f.metric("Expected call time", "N/A" if np.isnan(result['expected_call_time']) else f"{result['expected_call_time']:.2f}y")
 
             st.subheader("Confirmed market data")
             st.dataframe(edited, use_container_width=True, hide_index=True)
