@@ -35,6 +35,15 @@ def year_frac(d1, d2):
     return (to_date(d2) - to_date(d1)).days / 365.0
 
 
+def normalize_pct(x):
+    if x in (None, "", "None"):
+        raise ValueError("missing value")
+    x = float(x)
+    if x > 1.0:
+        x = x / 100.0
+    return x
+
+
 def yf_spot(ticker: str) -> float:
     hist = yf.Ticker(ticker).history(period="10d", auto_adjust=False)
     if hist.empty:
@@ -93,7 +102,7 @@ def alpha_dividend_yield(ticker: str):
     dy = data.get("DividendYield")
     if dy in (None, "", "None"):
         raise ValueError("Alpha Vantage dividend yield unavailable")
-    return float(dy)
+    return normalize_pct(dy)
 
 
 def finnhub_dividend_yield_from_profile(ticker: str):
@@ -107,7 +116,7 @@ def finnhub_dividend_yield_from_profile(ticker: str):
     dy = data.get("dividendYield")
     if dy in (None, "", "None"):
         raise ValueError("Finnhub profile dividend yield unavailable")
-    return float(dy)
+    return normalize_pct(dy)
 
 
 def finnhub_trailing_dividend_yield(ticker: str):
@@ -149,7 +158,7 @@ def yfinance_dividend_yield(ticker: str):
     )
     if dy is None:
         raise ValueError("yfinance dividend yield unavailable")
-    return dy
+    return normalize_pct(dy)
 
 
 def dividend_yield_from_history(ticker: str):
@@ -293,18 +302,19 @@ def hist_corr(tickers):
     if df.shape[1] < 2 or df.empty:
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
-    corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0).to_numpy()
-    corr = np.array(corr, dtype=float, copy=True)
-    np.fill_diagonal(corr, 1.0)
-    return pd.DataFrame(corr, index=tickers, columns=tickers)
+    corr_df = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
+    arr = corr_df.to_numpy(copy=True)
+    arr = np.array(arr, dtype=float, copy=True)
+    np.fill_diagonal(arr, 1.0)
+    return pd.DataFrame(arr, index=tickers, columns=tickers)
 
 
 def cholesky_with_fallback(corr):
-    corr = np.array(corr, dtype=float, copy=True)
+    arr = np.array(corr, dtype=float, copy=True)
     try:
-        return np.linalg.cholesky(corr)
+        return np.linalg.cholesky(arr)
     except Exception:
-        eigvals, eigvecs = np.linalg.eigh(corr)
+        eigvals, eigvecs = np.linalg.eigh(arr)
         eigvals = np.clip(eigvals, 1e-8, None)
         corr2 = eigvecs @ np.diag(eigvals) @ eigvecs.T
         corr2 = np.array(corr2, dtype=float, copy=True)
@@ -519,9 +529,9 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
             if inp[["Spot", "Vol", "Dividend Yield"]].isna().any().any():
                 raise ValueError("Missing confirmed market data. Please choose a source or type a value for Spot, Vol, and Dividend Yield.")
 
-            spot = inp["Spot"].astype(float).tolist()
-            vol = inp["Vol"].astype(float).tolist()
-            div = inp["Dividend Yield"].astype(float).tolist()
+            spot = list(map(float, np.array(inp["Spot"], dtype=float, copy=True)))
+            vol = list(map(float, np.array(inp["Vol"], dtype=float, copy=True)))
+            div = list(map(float, np.array(inp["Dividend Yield"], dtype=float, copy=True)))
 
             corr = hist_corr([t.upper().strip() for t in tickers])
             result = price_fcn(
