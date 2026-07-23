@@ -11,8 +11,8 @@ import yfinance as yf
 # =========================
 # API KEYS: FILL THESE IN
 # =========================
-ALPHAVANTAGE_API_KEY = ""
-FINNHUB_API_KEY = ""
+ALPHAVANTAGE_API_KEY = st.secrets["ALPHAVANTAGE_API_KEY"]
+FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
 # =========================
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
