@@ -135,7 +135,6 @@ def price_fcn(
     call_barrier,
     coupon_barrier,
     knock_in_barrier,
-    coupon_frequency_per_year=1.0,
     n_paths=20000,
     seed=11,
 ):
@@ -157,13 +156,6 @@ def price_fcn(
     called = np.zeros(n_paths, dtype=bool)
     call_time_bucket = np.full(n_paths, np.nan)
 
-    coupon_times = np.array(obs_months, dtype=float) / 12.0
-    if coupon_times.size == 0:
-        coupon_times = np.array([maturity])
-
-    # Option leg valuation:
-    # We price the worst-of embedded derivative as the present value of the product cashflows
-    # net of principal/funding leg. This is the robust, defendable option component used to set the coupon.
     option_leg_pv = np.zeros(n_paths)
 
     for idx in call_idx:
@@ -172,34 +164,34 @@ def price_fcn(
         if np.any(trigger):
             t = idx / steps * maturity
             principal_pv = notional * dfs[idx]
-            coupon_cashflow = notional * funding_cost * t * dfs[idx]
-            note_cashflow = (notional + coupon_cashflow) * dfs[idx]
+            coupon_support_pv = notional * funding_cost * t * dfs[idx]
+            note_cashflow = (notional + coupon_support_pv) * dfs[idx]
             pv[trigger] += note_cashflow
-            option_leg_pv[trigger] += note_cashflow - principal_pv - coupon_cashflow
+            option_leg_pv[trigger] += max(0.0, note_cashflow - principal_pv - coupon_support_pv)
             called[trigger] = True
             call_time_bucket[trigger] = t
 
     alive = ~called
     if np.any(alive):
-        t = maturity
         terminal = worst_maturity[alive]
-
-        coupon_cashflow = notional * funding_cost * t * dfs[maturity_idx]
-        base_principal_pv = notional * dfs[maturity_idx]
+        t = maturity
+        coupon_support_pv = notional * funding_cost * t * dfs[maturity_idx]
 
         redemption = np.where(
             terminal >= coupon_barrier,
-            notional + coupon_cashflow,
+            notional + coupon_support_pv,
             np.where(
                 terminal >= knock_in_barrier,
-                notional + coupon_cashflow,
+                notional + coupon_support_pv,
                 notional * terminal,
             ),
         )
 
         redemption_pv = redemption * dfs[maturity_idx]
         pv[alive] += redemption_pv
-        option_leg_pv[alive] += redemption_pv - base_principal_pv - coupon_cashflow
+
+        raw_option_pv = redemption_pv - notional * dfs[maturity_idx] - coupon_support_pv
+        option_leg_pv[alive] += np.maximum(0.0, raw_option_pv)
 
     note_pv = pv.mean()
     call_prob = float(np.mean(called))
@@ -279,7 +271,7 @@ with col2:
     funding_cost = st.number_input(
         "Funding cost (annual)", min_value=0.0, value=0.05, step=0.005, format="%.4f"
     )
-    st.caption("Funding cost is an issuer input. The coupon is solved as funding cost plus the priced worst-of option leg.")
+    st.caption("Funding cost is an issuer input. The option leg is priced from the worst-of FCN payoff and added to funding cost to set the coupon.")
 
 c1, c2, c3 = st.columns(3)
 with c1:
