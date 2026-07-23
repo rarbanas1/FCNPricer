@@ -1,7 +1,5 @@
 
 import math
-import os
-import re
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -11,7 +9,7 @@ import streamlit as st
 import yfinance as yf
 
 # =========================
-# API KEYS: EDIT THESE TWO LINES
+# API KEYS: FILL THESE IN
 # =========================
 ALPHAVANTAGE_API_KEY = "PT0LGXXYRI62PO7B"
 FINNHUB_API_KEY = "d8cguj1r01qidic7thjgd8cguj1r01qidic7thk0"
@@ -19,7 +17,7 @@ FINNHUB_API_KEY = "d8cguj1r01qidic7thjgd8cguj1r01qidic7thk0"
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Worst-of FCN / autocallable pricer with a two-step market data confirmation flow.")
+st.caption("Worst-of FCN / autocallable pricer with multi-source market data review.")
 
 ALPHAV_URL = "https://www.alphavantage.co/query"
 FINNHUB_URL = "https://finnhub.io/api/v1"
@@ -44,166 +42,167 @@ def yf_spot(ticker: str) -> float:
     return float(hist["Close"].dropna().iloc[-1])
 
 
-def alpha_vantage_spot(ticker: str) -> float:
-    params = {
-        "function": "GLOBAL_QUOTE",
-        "symbol": ticker,
-        "apikey": ALPHAVANTAGE_API_KEY,
-    }
-    r = requests.get(ALPHAV_URL, params=params, timeout=20)
+def alpha_spot(ticker: str) -> float:
+    r = requests.get(
+        ALPHAV_URL,
+        params={"function": "GLOBAL_QUOTE", "symbol": ticker, "apikey": ALPHAVANTAGE_API_KEY},
+        timeout=20,
+    )
     r.raise_for_status()
-    data = r.json()
-    q = data.get("Global Quote", {})
-    price = q.get("05. price")
-    if price is None:
-        raise ValueError(f"Alpha Vantage spot unavailable for {ticker}")
-    return float(price)
+    data = r.json().get("Global Quote", {})
+    px = data.get("05. price")
+    if px is None:
+        raise ValueError("Alpha Vantage spot unavailable")
+    return float(px)
 
 
-def alpha_vantage_dividend_yield(ticker: str):
-    params = {
-        "function": "OVERVIEW",
-        "symbol": ticker,
-        "apikey": ALPHAVANTAGE_API_KEY,
-    }
-    r = requests.get(ALPHAV_URL, params=params, timeout=20)
+def finnhub_spot(ticker: str) -> float:
+    r = requests.get(
+        f"{FINNHUB_URL}/quote",
+        params={"symbol": ticker, "token": FINNHUB_API_KEY},
+        timeout=20,
+    )
     r.raise_for_status()
     data = r.json()
-    if not data or "DividendYield" not in data:
-        raise ValueError(f"Alpha Vantage overview unavailable for {ticker}")
+    if data.get("c") is None:
+        raise ValueError("Finnhub spot unavailable")
+    return float(data["c"])
+
+
+def alpha_dividend_yield(ticker: str):
+    r = requests.get(
+        ALPHAV_URL,
+        params={"function": "OVERVIEW", "symbol": ticker, "apikey": ALPHAVANTAGE_API_KEY},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
     dy = data.get("DividendYield")
     if dy in (None, "", "None"):
-        raise ValueError(f"DividendYield missing for {ticker}")
+        raise ValueError("Alpha Vantage dividend yield unavailable")
     return float(dy)
 
 
-def alpha_vantage_iv(ticker: str, as_of: str | None = None):
-    # Best-effort: Alpha Vantage historical options chain endpoint availability depends on account/features.
-    # This block tries a documented-style query pattern and then falls back to a local estimate if needed.
-    candidates = []
-    if as_of:
-        candidates.append(
-            {
-                "function": "HISTORICAL_OPTIONS",
-                "symbol": ticker,
-                "date": as_of,
-                "apikey": ALPHAVANTAGE_API_KEY,
-            }
-        )
-    candidates.append(
-        {
-            "function": "HISTORICAL_OPTIONS",
-            "symbol": ticker,
-            "apikey": ALPHAVANTAGE_API_KEY,
-        }
+def finnhub_dividend_yield_from_profile(ticker: str):
+    r = requests.get(
+        f"{FINNHUB_URL}/stock/profile2",
+        params={"symbol": ticker, "token": FINNHUB_API_KEY},
+        timeout=20,
     )
+    r.raise_for_status()
+    data = r.json()
+    dy = data.get("dividendYield")
+    if dy in (None, "", "None"):
+        raise ValueError("Finnhub profile dividend yield unavailable")
+    return float(dy)
 
-    for params in candidates:
+
+def finnhub_trailing_dividend_yield(ticker: str):
+    r = requests.get(
+        f"{FINNHUB_URL}/stock/dividend",
+        params={"symbol": ticker, "token": FINNHUB_API_KEY},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError("Finnhub dividend history unavailable")
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.Timedelta(days=365)
+    total = 0.0
+    for row in data:
+        amt = row.get("amount")
+        dt = row.get("date")
+        if amt is None or dt is None:
+            continue
+        try:
+            d = pd.to_datetime(dt)
+        except Exception:
+            continue
+        if start <= d <= end:
+            total += float(amt)
+    px = finnhub_spot(ticker)
+    if px <= 0:
+        raise ValueError("Invalid spot for dividend yield calc")
+    return total / px
+
+
+def alpha_iv_from_history(ticker: str):
+    # Best effort: use historical options if available; otherwise fall back to realized-vol estimate.
+    for params in [
+        {"function": "HISTORICAL_OPTIONS", "symbol": ticker, "apikey": ALPHAVANTAGE_API_KEY},
+        {"function": "HISTORICAL_OPTIONS", "symbol": ticker, "date": str(date.today()), "apikey": ALPHAVANTAGE_API_KEY},
+    ]:
         try:
             r = requests.get(ALPHAV_URL, params=params, timeout=20)
             r.raise_for_status()
             data = r.json()
             if isinstance(data, dict):
-                for key in data.keys():
-                    if isinstance(data[key], list) and data[key]:
-                        rows = data[key]
+                for v in data.values():
+                    if isinstance(v, list) and v:
                         ivs = []
-                        for row in rows:
-                            for iv_key in ("impliedVolatility", "iv", "implied_volatility"):
-                                if iv_key in row and row[iv_key] not in (None, "", "None"):
+                        for row in v:
+                            for key in ("impliedVolatility", "iv", "implied_volatility"):
+                                if key in row and row[key] not in (None, "", "None"):
                                     try:
-                                        ivs.append(float(row[iv_key]))
-                                        break
+                                        val = float(row[key])
+                                        ivs.append(val / 100.0 if val > 5 else val)
                                     except Exception:
                                         pass
                         if ivs:
-                            iv = float(np.nanmedian(ivs))
-                            return iv / 100.0 if iv > 5 else iv
+                            return float(np.nanmedian(ivs))
         except Exception:
             pass
-
-    raise ValueError(f"Alpha Vantage IV unavailable for {ticker}")
-
-
-def finnhub_quote(ticker: str):
-    url = f"{FINNHUB_URL}/quote"
-    params = {"symbol": ticker, "token": FINNHUB_API_KEY}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    hist = yf.Ticker(ticker).history(period="1y", auto_adjust=False)
+    if hist.empty:
+        raise ValueError("IV unavailable")
+    r = np.log(hist["Close"].dropna()).diff().dropna()
+    if r.empty:
+        raise ValueError("IV unavailable")
+    return float(max(0.05, min(2.0, r.std() * np.sqrt(252))))
 
 
-def finnhub_profile2(ticker: str):
-    url = f"{FINNHUB_URL}/stock/profile2"
-    params = {"symbol": ticker, "token": FINNHUB_API_KEY}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def finnhub_dividend_yield(ticker: str):
-    prof = finnhub_profile2(ticker)
-    for k in ("dividendYield", "dividend_yield"):
-        if k in prof and prof[k] not in (None, "", "None"):
-            return float(prof[k])
-    raise ValueError(f"Finnhub dividend yield unavailable for {ticker}")
-
-
-def finnhub_spot(ticker: str):
-    q = finnhub_quote(ticker)
-    c = q.get("c")
-    if c is None:
-        raise ValueError(f"Finnhub spot unavailable for {ticker}")
-    return float(c)
-
-
-def fetch_market_data(ticker: str):
+def fetch_candidates(ticker: str):
     ticker = ticker.upper().strip()
-    row = {"Ticker": ticker, "Spot": np.nan, "Vol": np.nan, "Dividend Yield": np.nan}
-    status = {"Ticker": ticker, "Spot Source": "manual", "IV Source": "manual", "Div Source": "manual"}
-
-    # Spot: prefer Finnhub, fallback Alpha Vantage, fallback Yahoo
+    cand = {
+        "Ticker": ticker,
+        "Spot - Finnhub": np.nan,
+        "Spot - Alpha Vantage": np.nan,
+        "Spot - yfinance": np.nan,
+        "IV - Alpha Vantage": np.nan,
+        "Div - Finnhub profile": np.nan,
+        "Div - Finnhub trailing": np.nan,
+        "Div - Alpha Vantage": np.nan,
+    }
     try:
-        row["Spot"] = finnhub_spot(ticker)
-        status["Spot Source"] = "Finnhub"
+        cand["Spot - Finnhub"] = finnhub_spot(ticker)
     except Exception:
-        try:
-            row["Spot"] = alpha_vantage_spot(ticker)
-            status["Spot Source"] = "Alpha Vantage"
-        except Exception:
-            try:
-                row["Spot"] = yf_spot(ticker)
-                status["Spot Source"] = "yfinance"
-            except Exception:
-                pass
-
-    # Dividend yield: prefer Finnhub, fallback Alpha Vantage
+        pass
     try:
-        row["Dividend Yield"] = finnhub_dividend_yield(ticker)
-        status["Div Source"] = "Finnhub"
+        cand["Spot - Alpha Vantage"] = alpha_spot(ticker)
     except Exception:
-        try:
-            row["Dividend Yield"] = alpha_vantage_dividend_yield(ticker)
-            status["Div Source"] = "Alpha Vantage"
-        except Exception:
-            pass
-
-    # IV: prefer Alpha Vantage historical options, fallback local estimate from yfinance history if needed
+        pass
     try:
-        row["Vol"] = alpha_vantage_iv(ticker)
-        status["IV Source"] = "Alpha Vantage"
+        cand["Spot - yfinance"] = yf_spot(ticker)
     except Exception:
-        try:
-            hist = yf.Ticker(ticker).history(period="1y", auto_adjust=False)
-            if not hist.empty:
-                r = np.log(hist["Close"].dropna()).diff().dropna()
-                if not r.empty:
-                    row["Vol"] = float(max(0.05, min(2.0, r.std() * np.sqrt(252))))
-                    status["IV Source"] = "yfinance estimate"
-        except Exception:
-            pass
-
-    return row, status
+        pass
+    try:
+        cand["IV - Alpha Vantage"] = alpha_iv_from_history(ticker)
+    except Exception:
+        pass
+    try:
+        cand["Div - Finnhub profile"] = finnhub_dividend_yield_from_profile(ticker)
+    except Exception:
+        pass
+    try:
+        cand["Div - Finnhub trailing"] = finnhub_trailing_dividend_yield(ticker)
+    except Exception:
+        pass
+    try:
+        cand["Div - Alpha Vantage"] = alpha_dividend_yield(ticker)
+    except Exception:
+        pass
+    return cand
 
 
 def hist_corr(tickers):
@@ -218,8 +217,7 @@ def hist_corr(tickers):
     if df.shape[1] < 2 or df.empty:
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
-    corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
-    corr = corr.to_numpy(copy=True)
+    corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0).to_numpy()
     np.fill_diagonal(corr, 1.0)
     return pd.DataFrame(corr, index=tickers, columns=tickers)
 
@@ -257,22 +255,8 @@ def worst_of_ratio(paths, spot):
     return (paths / np.array(spot)[None, None, :]).min(axis=2)
 
 
-def price_fcn(
-    spot,
-    vol,
-    div,
-    corr,
-    valuation_date,
-    maturity_date,
-    obs_months,
-    funding_cost,
-    notional,
-    call_barrier,
-    coupon_barrier,
-    knock_in_barrier,
-    n_paths=12000,
-    seed=11,
-):
+def price_fcn(spot, vol, div, corr, valuation_date, maturity_date, obs_months, funding_cost, notional,
+              call_barrier, coupon_barrier, knock_in_barrier, n_paths=12000, seed=11):
     maturity = max(year_frac(valuation_date, maturity_date), 0.01)
     steps = max(252, int(252 * maturity))
     paths = simulate_paths(spot, vol, div, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
@@ -330,89 +314,101 @@ def build_schedule(valuation_date, obs_months, maturity_date):
     return pd.DataFrame(rows)
 
 
-def format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier):
-    out = inp.copy()
-    out["Knock-in strike"] = out["Spot"] * knock_in_barrier
-    out["Coupon strike"] = out["Spot"] * coupon_barrier
-    out["Call strike"] = out["Spot"] * call_barrier
-    out["Spot"] = out["Spot"].map(lambda x: f"{x:.2f}")
-    out["Vol"] = out["Vol"].map(lambda x: f"{x:.2%}")
-    out["Dividend Yield"] = out["Dividend Yield"].map(lambda x: f"{x:.2%}")
-    out["Knock-in strike"] = out["Knock-in strike"].map(lambda x: f"{x:.2f}")
-    out["Coupon strike"] = out["Coupon strike"].map(lambda x: f"{x:.2f}")
-    out["Call strike"] = out["Call strike"].map(lambda x: f"{x:.2f}")
-    return out
+def fmt(x, pct=False):
+    if pd.isna(x):
+        return ""
+    return f"{x:.2%}" if pct else f"{x:.4f}" if abs(x) < 1 else f"{x:.2f}"
 
-
-def corr_long_df(corr_df):
-    out = corr_df.copy()
-    out.insert(0, "Underlying", out.index)
-    return out.reset_index(drop=True)
-
-
-st.markdown(
-    """
-<style>
-.block-container { max-width: 1200px !important; margin-left: auto; margin-right: auto; padding-top: 1.25rem; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
 
 if "step" not in st.session_state:
     st.session_state.step = 1
-if "market_df" not in st.session_state:
-    st.session_state.market_df = None
-if "status_df" not in st.session_state:
-    st.session_state.status_df = None
+if "candidates" not in st.session_state:
+    st.session_state.candidates = None
 
 st.header("Inputs and assumptions")
 
-col1, col2 = st.columns([2, 1])
-with col1:
+c1, c2 = st.columns([2, 1])
+with c1:
     n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
     default_tickers = ["DRAM", "SOXX", "FXI", "XLK"]
     tickers = [st.text_input(f"Ticker {i+1}", value=default_tickers[i]) for i in range(n_names)]
     valuation_date = st.date_input("Valuation date", value=date.today())
     maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
     notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
-with col2:
-    st.markdown("### Funding")
+with c2:
     funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f")
 
-c1, c2, c3 = st.columns(3)
-with c1:
+b1, b2, b3 = st.columns(3)
+with b1:
     call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
     coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
-with c2:
+with b2:
     knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
     n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
-with c3:
+with b3:
     seed = st.number_input("Random seed", min_value=1, value=11, step=1)
     obs_months = st.multiselect("Months from valuation", options=list(range(1, 61)), default=[6])
 
 st.markdown("### Step 1")
 st.write("Enter the product terms above.")
 
-if st.button("Load / Confirm market data", type="primary", use_container_width=True):
-    rows, stats = [], []
+if st.button("Load market candidates", type="primary", use_container_width=True):
+    rows = []
     for t in tickers:
-        md, stt = fetch_market_data(t)
-        rows.append(md)
-        stats.append(stt)
-    st.session_state.market_df = pd.DataFrame(rows)
-    st.session_state.status_df = pd.DataFrame(stats)
+        rows.append(fetch_candidates(t))
+    st.session_state.candidates = pd.DataFrame(rows)
     st.session_state.step = 2
 
-if st.session_state.step >= 2 and st.session_state.market_df is not None:
+if st.session_state.step >= 2 and st.session_state.candidates is not None:
     st.markdown("### Step 2")
-    st.write("Review the market data below. Edit anything unusual, then press Calculate.")
-    if st.session_state.status_df is not None:
-        st.dataframe(st.session_state.status_df, use_container_width=True, hide_index=True)
+    st.write("Review the available candidates and choose the source for each field.")
 
-    editor_df = st.session_state.market_df.copy()
+    cand = st.session_state.candidates.copy()
+    st.dataframe(cand, use_container_width=True, hide_index=True)
+
+    selected_rows = []
+    for i, t in enumerate(tickers):
+        row = cand.iloc[i].to_dict()
+        st.markdown(f"#### {t.upper().strip()}")
+        spot_source = st.selectbox(
+            f"{t} spot source",
+            ["Finnhub", "Alpha Vantage", "yfinance"],
+            index=0,
+            key=f"spot_src_{i}",
+        )
+        iv_source = st.selectbox(
+            f"{t} IV source",
+            ["Alpha Vantage", "Manual"],
+            index=0 if pd.notna(row.get("IV - Alpha Vantage")) else 1,
+            key=f"iv_src_{i}",
+        )
+        div_source = st.selectbox(
+            f"{t} dividend source",
+            ["Finnhub profile", "Finnhub trailing", "Alpha Vantage", "Manual"],
+            index=0,
+            key=f"div_src_{i}",
+        )
+
+        spot_val = row.get("Spot - Finnhub") if spot_source == "Finnhub" else row.get("Spot - Alpha Vantage") if spot_source == "Alpha Vantage" else row.get("Spot - yfinance")
+        iv_val = row.get("IV - Alpha Vantage") if iv_source == "Alpha Vantage" else np.nan
+        div_val = row.get("Div - Finnhub profile") if div_source == "Finnhub profile" else row.get("Div - Finnhub trailing") if div_source == "Finnhub trailing" else row.get("Div - Alpha Vantage") if div_source == "Alpha Vantage" else np.nan
+
+        selected_rows.append(
+            {
+                "Ticker": t.upper().strip(),
+                "Spot": spot_val,
+                "Vol": iv_val,
+                "Dividend Yield": div_val,
+                "Spot Source": spot_source,
+                "IV Source": iv_source,
+                "Div Source": div_source,
+            }
+        )
+
+    selected_df = pd.DataFrame(selected_rows)
+    st.markdown("### Confirmed inputs")
     edited = st.data_editor(
-        editor_df,
+        selected_df,
         use_container_width=True,
         num_rows="fixed",
         column_config={
@@ -420,7 +416,7 @@ if st.session_state.step >= 2 and st.session_state.market_df is not None:
             "Vol": st.column_config.NumberColumn("Implied Vol", help="Decimal form, e.g. 0.615 = 61.5%"),
             "Dividend Yield": st.column_config.NumberColumn("Dividend Yield", help="Decimal form, e.g. 0.002 = 0.2%"),
         },
-        key="market_editor",
+        key="confirmed_editor",
     )
 
     if st.button("Calculate", type="primary", use_container_width=True):
@@ -429,50 +425,39 @@ if st.session_state.step >= 2 and st.session_state.market_df is not None:
             for col in ["Spot", "Vol", "Dividend Yield"]:
                 inp[col] = pd.to_numeric(inp[col], errors="coerce")
             if inp[["Spot", "Vol", "Dividend Yield"]].isna().any().any():
-                raise ValueError("Missing market data. Please fill all Spot, Vol, and Dividend Yield values before calculating.")
+                raise ValueError("Missing confirmed market data. Please choose a source or type a value for Spot, Vol, and Dividend Yield.")
 
             spot = inp["Spot"].astype(float).tolist()
             vol = inp["Vol"].astype(float).tolist()
             div = inp["Dividend Yield"].astype(float).tolist()
-            corr = hist_corr([t.strip().upper() for t in tickers])
 
+            corr = hist_corr([t.upper().strip() for t in tickers])
             result = price_fcn(
-                spot=spot,
-                vol=vol,
-                div=div,
-                corr=corr,
-                valuation_date=valuation_date,
-                maturity_date=maturity_date,
-                obs_months=obs_months,
-                funding_cost=funding_cost,
-                notional=notional,
-                call_barrier=call_barrier,
-                coupon_barrier=coupon_barrier,
-                knock_in_barrier=knock_in_barrier,
-                n_paths=int(n_paths),
-                seed=int(seed),
+                spot, vol, div, corr,
+                valuation_date, maturity_date, obs_months,
+                funding_cost, notional, call_barrier, coupon_barrier, knock_in_barrier,
+                n_paths=int(n_paths), seed=int(seed),
             )
 
             st.subheader("Results")
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("Note PV", f"{result['note_pv']:,.2f}")
-            r2.metric("Funding cost", f"{result['funding_cost']:.2%}")
-            r3.metric("Option value", f"{result['option_value']:.2%}")
-            r4.metric("Final coupon", f"{result['coupon_rate']:.2%}")
+            a, b, c, d = st.columns(4)
+            a.metric("Note PV", f"{result['note_pv']:,.2f}")
+            b.metric("Funding cost", f"{result['funding_cost']:.2%}")
+            c.metric("Option value", f"{result['option_value']:.2%}")
+            d.metric("Final coupon", f"{result['coupon_rate']:.2%}")
 
-            r5, r6 = st.columns(2)
-            r5.metric("Call probability", f"{result['call_prob']:.2%}")
-            r6.metric("Expected call time", "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y")
+            e, f = st.columns(2)
+            e.metric("Call probability", f"{result['call_prob']:.2%}")
+            f.metric("Expected call time", "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y")
 
-            st.subheader("Underlying details")
-            st.dataframe(format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier), use_container_width=True, hide_index=True)
+            st.subheader("Confirmed market data")
+            st.dataframe(edited, use_container_width=True, hide_index=True)
 
             st.subheader("Correlation matrix")
             st.dataframe(corr.round(4), use_container_width=True)
-            st.dataframe(corr_long_df(corr).round(4), use_container_width=True, hide_index=True)
 
             st.subheader("Schedule")
             st.dataframe(build_schedule(valuation_date, obs_months, maturity_date), use_container_width=True, hide_index=True)
 
-        except Exception as e:
-            st.error(str(e))
+        except Exception as ex:
+            st.error(str(ex))
