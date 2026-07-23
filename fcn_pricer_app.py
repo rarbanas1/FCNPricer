@@ -7,12 +7,23 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
+import re
 
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
-st.caption("Worst-of FCN / autocallable pricer with implied vol and current dividend yield.")
+st.caption("Worst-of FCN / autocallable pricer with Market Chameleon market data and editable confirmation step.")
 
 TEMPLATE = Path(__file__).with_name("fcn_pricer_template.xlsx")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 
 def to_date(x):
@@ -27,62 +38,116 @@ def year_frac(d1, d2):
     return (to_date(d2) - to_date(d1)).days / 365.0
 
 
-def get_spot(ticker: str) -> float:
+def get_spot_yf(ticker: str) -> float:
     hist = yf.Ticker(ticker).history(period="10d", auto_adjust=False)
     if hist.empty:
         raise ValueError(f"No price data for {ticker}")
     return float(hist["Close"].dropna().iloc[-1])
 
 
-def get_implied_vol(ticker: str) -> float:
-    t = yf.Ticker(ticker)
-    expiries = []
+def fetch_page(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def mc_url(ticker: str, kind: str) -> str:
+    ticker = ticker.upper().strip()
+    if kind == "iv":
+        return f"https://marketchameleon.com/Overview/{ticker}/IV/"
+    if kind == "div":
+        return f"https://marketchameleon.com/Overview/{ticker}/Dividends/"
+    if kind == "spot":
+        return f"https://marketchameleon.com/Overview/{ticker}/Summary/"
+    if kind == "strike":
+        return f"https://marketchameleon.com/Overview/{ticker}/Summary/"
+    raise ValueError(kind)
+
+
+def _first_float(patterns, text):
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I | re.S)
+        if m:
+            val = m.group(1).replace(",", "").strip()
+            try:
+                return float(val)
+            except Exception:
+                pass
+    return None
+
+
+def parse_mc_iv(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    txt = soup.get_text(" ", strip=True)
+    val = _first_float(
+        [
+            r"implied volatility \\(IV\\) is\s*([0-9]+(?:\.[0-9]+)?)",
+            r"IV\)\s*is\s*([0-9]+(?:\.[0-9]+)?)",
+            r"implied volatility[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+        ],
+        txt,
+    )
+    if val is None:
+        raise ValueError("Could not parse implied volatility from Market Chameleon.")
+    return val / 100.0 if val > 5 else val
+
+
+def parse_mc_div_yield(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    txt = soup.get_text(" ", strip=True)
+    val = _first_float(
+        [
+            r"Forward Dividend Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
+            r"Dividend Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
+            r"Div Yield:\s*([0-9]+(?:\.[0-9]+)?)%",
+        ],
+        txt,
+    )
+    if val is None:
+        raise ValueError("Could not parse dividend yield from Market Chameleon.")
+    return val / 100.0
+
+
+def parse_mc_spot(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    txt = soup.get_text(" ", strip=True)
+    val = _first_float(
+        [
+            r"Today\s+[+\-]?[0-9.]+\s+([0-9]+(?:\.[0-9]+)?)",
+            r"Last Price\s*([0-9]+(?:\.[0-9]+)?)",
+            r"price quote.*?([0-9]+(?:\.[0-9]+)?)",
+        ],
+        txt,
+    )
+    if val is None:
+        raise ValueError("Could not parse spot from Market Chameleon.")
+    return val
+
+
+def get_market_chameleon_data(ticker: str):
+    ticker = ticker.upper().strip()
+    data = {}
+    errors = []
+
     try:
-        expiries = list(t.options or [])
-    except Exception:
-        expiries = []
+        html = fetch_page(mc_url(ticker, "iv"))
+        data["Implied Vol"] = parse_mc_iv(html)
+    except Exception as e:
+        errors.append(f"IV: {e}")
 
-    for exp in expiries[:3]:
-        try:
-            chain = t.option_chain(exp)
-            calls = chain.calls.copy()
-            puts = chain.puts.copy()
-            if calls.empty or puts.empty:
-                continue
-
-            for df in (calls, puts):
-                if "impliedVolatility" in df.columns:
-                    df["moneyness"] = (df["strike"] / df["strike"].median()).abs()
-                    near_atm = df.sort_values("moneyness").head(8)
-                    iv = pd.to_numeric(near_atm["impliedVolatility"], errors="coerce").dropna()
-                    if not iv.empty:
-                        v = float(iv.median())
-                        if 0.01 <= v <= 5.0:
-                            return v
-        except Exception:
-            pass
-
-    hist = t.history(period="1y", auto_adjust=False)
-    if hist.empty:
-        return 0.30
-    r = np.log(hist["Close"].dropna()).diff().dropna()
-    if r.empty:
-        return 0.30
-    return float(max(0.05, min(2.0, r.std() * np.sqrt(252))))
-
-
-def get_dividend_yield(ticker: str) -> float:
     try:
-        info = yf.Ticker(ticker).info or {}
-        dy = info.get("dividendYield")
-        if dy is None:
-            return 0.0
-        dy = float(dy)
-        if not np.isfinite(dy) or dy < 0:
-            return 0.0
-        return dy
-    except Exception:
-        return 0.0
+        html = fetch_page(mc_url(ticker, "div"))
+        data["Dividend Yield"] = parse_mc_div_yield(html)
+    except Exception as e:
+        errors.append(f"Div: {e}")
+
+    try:
+        html = fetch_page(mc_url(ticker, "spot"))
+        data["Spot"] = parse_mc_spot(html)
+    except Exception as e:
+        errors.append(f"Spot: {e}")
+
+    return data, errors
 
 
 def hist_corr(tickers):
@@ -146,15 +211,13 @@ def price_fcn(
     corr,
     valuation_date,
     maturity_date,
-    call_dates,
-    coupon_dates,
     obs_months,
     funding_cost,
     notional,
     call_barrier,
     coupon_barrier,
     knock_in_barrier,
-    coupon_per_obs=0.01,
+    coupon_per_obs,
     n_paths=20000,
     seed=11,
 ):
@@ -162,40 +225,32 @@ def price_fcn(
     steps = max(252, int(252 * maturity))
     paths = simulate_paths(spot, vol, div, corr, maturity, n_paths=n_paths, steps=steps, seed=seed)
 
-    call_times = [year_frac(valuation_date, d) for d in call_dates if to_date(d) > to_date(valuation_date)]
+    call_times = [year_frac(valuation_date, valuation_date + timedelta(days=int(30.4375 * m))) for m in obs_months]
     call_idx = [min(steps, max(1, int(round(t / maturity * steps)))) for t in call_times]
     maturity_idx = steps
 
     worst_call = worst_of_ratio(paths, spot)
     worst_maturity = worst_call[:, maturity_idx]
 
-    discount_rate = 0.0
-    dfs = {i: math.exp(-discount_rate * (i / steps) * maturity) for i in range(steps + 1)}
-
     pv = np.zeros(n_paths)
     called = np.zeros(n_paths, dtype=bool)
     call_time_bucket = np.full(n_paths, np.nan)
-
-    option_leg_pv = np.zeros(n_paths)
 
     for idx in call_idx:
         alive = ~called
         trigger = alive & (worst_call[:, idx] >= call_barrier)
         if np.any(trigger):
             t = idx / steps * maturity
-            coupon_cashflow = notional * coupon_per_obs * max(1.0, round(t / (maturity / max(len(call_idx), 1)), 6))
-            note_cashflow = (notional + coupon_cashflow) * dfs[idx]
-            principal_pv = notional * dfs[idx]
-            coupon_support_pv = coupon_cashflow * dfs[idx]
+            coupon_cashflow = notional * coupon_per_obs * max(1.0, round(t / max(maturity / max(len(call_idx), 1), 1e-9)))
+            note_cashflow = notional + coupon_cashflow
             pv[trigger] += note_cashflow
-            option_leg_pv[trigger] += np.maximum(0.0, note_cashflow - principal_pv - coupon_support_pv)
             called[trigger] = True
             call_time_bucket[trigger] = t
 
     alive = ~called
     if np.any(alive):
         terminal = worst_maturity[alive]
-        coupon_cashflow = notional * coupon_per_obs * maturity * dfs[maturity_idx]
+        coupon_cashflow = notional * coupon_per_obs * maturity
 
         redemption = np.where(
             terminal >= coupon_barrier,
@@ -206,19 +261,14 @@ def price_fcn(
                 notional * terminal,
             ),
         )
-
-        redemption_pv = redemption * dfs[maturity_idx]
-        pv[alive] += redemption_pv
-
-        raw_option_pv = redemption_pv - notional * dfs[maturity_idx] - coupon_cashflow
-        option_leg_pv[alive] += np.maximum(0.0, raw_option_pv)
+        pv[alive] += redemption
 
     note_pv = pv.mean()
     call_prob = float(np.mean(called))
     expected_call_time = float(np.nanmean(call_time_bucket)) if np.any(~np.isnan(call_time_bucket)) else float("nan")
     expected_payoff = float(pv.mean() / notional)
 
-    option_value = float(option_leg_pv.mean() / notional)
+    option_value = max(0.0, float((note_pv / notional) - 1.0))
     coupon_rate = funding_cost + option_value
 
     return {
@@ -235,10 +285,9 @@ def price_fcn(
     }
 
 
-def build_schedule(valuation_date, call_dates, coupon_dates, maturity_date):
+def build_schedule(valuation_date, obs_months, maturity_date):
     sch_rows = [{"Type": "Valuation", "Date": str(valuation_date)}]
-    sch_rows += [{"Type": "Call", "Date": str(d)} for d in call_dates]
-    sch_rows += [{"Type": "Coupon", "Date": str(d)} for d in coupon_dates]
+    sch_rows += [{"Type": "Call/Coupon Obs", "Date": str(valuation_date + timedelta(days=int(30.4375 * m)))} for m in obs_months]
     sch_rows += [{"Type": "Maturity", "Date": str(maturity_date)}]
     return pd.DataFrame(sch_rows)
 
@@ -250,6 +299,10 @@ def format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier)
     out["Call strike"] = out["Spot"] * call_barrier
     out["Implied Vol"] = out["Vol"].map(lambda x: f"{x:.2%}")
     out["Current Dividend Yield"] = out["Dividend Yield"].map(lambda x: f"{x:.2%}")
+    out["Spot"] = out["Spot"].map(lambda x: f"{x:.2f}")
+    out["Knock-in strike"] = out["Knock-in strike"].map(lambda x: f"{x:.2f}")
+    out["Coupon strike"] = out["Coupon strike"].map(lambda x: f"{x:.2f}")
+    out["Call strike"] = out["Call strike"].map(lambda x: f"{x:.2f}")
     return out
 
 
@@ -263,148 +316,168 @@ st.markdown(
     """
 <style>
 .block-container {
-    max-width: 1150px !important;
+    max-width: 1200px !important;
     margin-left: auto;
     margin-right: auto;
-    padding-top: 1.5rem;
+    padding-top: 1.25rem;
 }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "market_df" not in st.session_state:
+    st.session_state.market_df = None
+
 st.header("Inputs and assumptions")
 
 col1, col2 = st.columns([2, 1])
 with col1:
-    n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2)
-    tickers = []
+    n_names = st.selectbox("Number of underlyings", [1, 2, 3, 4], index=2, key="n_names")
     default_tickers = ["DRAM", "SOXX", "FXI", "XLK"]
+    tickers = []
     for i in range(n_names):
-        tickers.append(st.text_input(f"Ticker {i+1}", value=default_tickers[i]))
-    valuation_date = st.date_input("Valuation date", value=date.today())
-    maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540))
-    notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
+        tickers.append(st.text_input(f"Ticker {i+1}", value=default_tickers[i], key=f"ticker_{i}"))
+    valuation_date = st.date_input("Valuation date", value=date.today(), key="valuation_date")
+    maturity_date = st.date_input("Maturity date", value=date.today() + timedelta(days=540), key="maturity_date")
+    notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0, key="notional")
 
 with col2:
     st.markdown("### Funding")
-    funding_cost = st.number_input(
-        "Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f"
-    )
-    st.caption("Funding cost is an issuer input. The option leg is priced from the worst-of FCN payoff and added to funding cost to set the coupon.")
+    funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f", key="funding_cost")
+    st.caption("Funding cost is an issuer input. The market data is confirmed in step two before calculation.")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f")
+    call_barrier = st.number_input("Call barrier", min_value=0.0, value=1.0, step=0.01, format="%.4f", key="call_barrier")
     st.caption("If the worst-performing underlying is at or above this level on an observation date, the note can autocall.")
-    coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
+    coupon_barrier = st.number_input("Coupon barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f", key="coupon_barrier")
     st.caption("If the worst-performing underlying stays at or above this level, the coupon condition is met.")
 with c2:
-    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f")
+    knock_in_barrier = st.number_input("Knock-in barrier", min_value=0.0, value=0.5, step=0.01, format="%.4f", key="knock_in_barrier")
     st.caption("If the worst-performing underlying falls below this level, downside principal exposure is activated.")
-    n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000)
+    n_paths = st.number_input("Simulation paths", min_value=1000, value=12000, step=1000, key="n_paths")
 with c3:
-    seed = st.number_input("Random seed", min_value=1, value=11, step=1)
+    seed = st.number_input("Random seed", min_value=1, value=11, step=1, key="seed")
     st.markdown("### Observation dates")
-    obs_months = st.multiselect(
-        "Months from valuation",
-        options=list(range(1, 61)),
-        default=[6],
+    obs_months = st.multiselect("Months from valuation", options=list(range(1, 61)), default=[6], key="obs_months")
+
+st.markdown("### Step 1")
+st.write("Enter the product terms above.")
+
+if st.button("Load / Confirm market data", type="primary", use_container_width=True):
+    rows = []
+    errors = []
+    for t in tickers:
+        try:
+            spot_yf = get_spot_yf(t)
+        except Exception:
+            spot_yf = np.nan
+
+        data = {"Ticker": t, "Spot": spot_yf, "Vol": np.nan, "Dividend Yield": np.nan}
+        try:
+            mc_data, mc_errors = get_market_chameleon_data(t)
+            data.update({k: v for k, v in mc_data.items() if k in data})
+            if mc_errors:
+                errors.append(f"{t}: " + " | ".join(mc_errors))
+        except Exception as e:
+            errors.append(f"{t}: {e}")
+        rows.append(data)
+
+    st.session_state.market_df = pd.DataFrame(rows)
+    st.session_state.step = 2
+    if errors:
+        st.warning("Some Market Chameleon fields could not be loaded. You can edit them manually in step two.")
+
+if st.session_state.step == 2 and st.session_state.market_df is not None:
+    st.markdown("### Step 2")
+    st.write("Review the market data below. Edit anything unusual, then press Calculate.")
+
+    editor_df = st.session_state.market_df.copy()
+    editor_df["Spot"] = pd.to_numeric(editor_df["Spot"], errors="coerce")
+    editor_df["Vol"] = pd.to_numeric(editor_df["Vol"], errors="coerce")
+    editor_df["Dividend Yield"] = pd.to_numeric(editor_df["Dividend Yield"], errors="coerce")
+
+    edited = st.data_editor(
+        editor_df,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "Spot": st.column_config.NumberColumn("Spot", help="Market spot price"),
+            "Vol": st.column_config.NumberColumn("Implied Vol", help="Enter as decimal, e.g. 0.615 for 61.5%"),
+            "Dividend Yield": st.column_config.NumberColumn("Dividend Yield", help="Enter as decimal, e.g. 0.002 for 0.2%"),
+        },
+        key="market_editor",
     )
 
-calc_col1, calc_col2, calc_col3 = st.columns([1, 2, 1])
-with calc_col2:
-    calculate = st.button("Calculate", type="primary", use_container_width=True)
+    if st.button("Calculate", type="primary", use_container_width=True):
+        try:
+            inp = edited.copy()
+            if inp[["Spot", "Vol", "Dividend Yield"]].isna().any().any():
+                raise ValueError("Missing market data. Please fill all Spot, Vol, and Dividend Yield values before calculating.")
 
-if not calculate:
-    st.info("Set inputs above and click Calculate to run the pricer.")
+            spot = inp["Spot"].astype(float).tolist()
+            vol = inp["Vol"].astype(float).tolist()
+            div = inp["Dividend Yield"].astype(float).tolist()
 
-if calculate:
-    try:
-        rows = []
-        for t in tickers:
-            spot = get_spot(t)
-            iv = get_implied_vol(t)
-            div = get_dividend_yield(t)
-            rows.append({"Ticker": t, "Spot": spot, "Vol": iv, "Dividend Yield": div})
+            corr = hist_corr([t.strip().upper() for t in tickers])
 
-        inp = pd.DataFrame(rows)
-        spot = inp["Spot"].tolist()
-        vol = inp["Vol"].tolist()
-        div = inp["Dividend Yield"].tolist()
+            result = price_fcn(
+                spot=spot,
+                vol=vol,
+                div=div,
+                corr=corr,
+                valuation_date=valuation_date,
+                maturity_date=maturity_date,
+                obs_months=obs_months,
+                funding_cost=funding_cost,
+                notional=notional,
+                call_barrier=call_barrier,
+                coupon_barrier=coupon_barrier,
+                knock_in_barrier=knock_in_barrier,
+                coupon_per_obs=0.0,
+                n_paths=int(n_paths),
+                seed=int(seed),
+            )
 
-        corr = hist_corr(tickers)
+            st.subheader("Results")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Note PV", f"{result['note_pv']:,.2f}")
+            r2.metric("Funding cost", f"{result['funding_cost']:.2%}")
+            r3.metric("Option value", f"{result['option_value']:.2%}")
+            r4.metric("Final coupon", f"{result['coupon_rate']:.2%}")
 
-        call_dates = [valuation_date + timedelta(days=int(30.4375 * m)) for m in obs_months]
-        coupon_dates = [maturity_date]
+            r5, r6 = st.columns(2)
+            r5.metric("Call probability", f"{result['call_prob']:.2%}")
+            r6.metric("Expected call time", "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y")
 
-        result = price_fcn(
-            spot=spot,
-            vol=vol,
-            div=div,
-            corr=corr,
-            valuation_date=valuation_date,
-            maturity_date=maturity_date,
-            call_dates=call_dates,
-            coupon_dates=coupon_dates,
-            obs_months=obs_months,
-            funding_cost=funding_cost,
-            notional=notional,
-            call_barrier=call_barrier,
-            coupon_barrier=coupon_barrier,
-            knock_in_barrier=knock_in_barrier,
-            n_paths=int(n_paths),
-            seed=int(seed),
-        )
+            st.subheader("Underlying details")
+            underlying_df = format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier)
+            st.dataframe(underlying_df, use_container_width=True, hide_index=True)
 
-        st.subheader("Results")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Note PV", f"{result['note_pv']:,.2f}")
-        r2.metric("Funding cost", f"{result['funding_cost']:.2%}")
-        r3.metric("Option value", f"{result['option_value']:.2%}")
-        r4.metric("Final coupon", f"{result['coupon_rate']:.2%}")
+            st.subheader("Correlation matrix")
+            st.dataframe(corr.round(4), use_container_width=True)
+            st.dataframe(corr_long_df(corr).round(4), use_container_width=True, hide_index=True)
 
-        r5, r6 = st.columns(2)
-        r5.metric("Call probability", f"{result['call_prob']:.2%}")
-        r6.metric(
-            "Expected call time",
-            "N/A" if np.isnan(result["expected_call_time"]) else f"{result['expected_call_time']:.2f}y",
-        )
+            st.subheader("Schedule")
+            st.dataframe(build_schedule(valuation_date, obs_months, maturity_date), use_container_width=True, hide_index=True)
 
-        st.subheader("Underlying details")
-        underlying_df = format_underlying_table(inp, call_barrier, coupon_barrier, knock_in_barrier)
-        st.dataframe(underlying_df, use_container_width=True, hide_index=True)
+            st.subheader("Model notes and references")
+            st.write(
+                "This app uses Market Chameleon market data where available, with user-editable fallbacks in step two. "
+                "The pricing engine uses the basket's worst-of dynamics, and the displayed market fields are confirmed before calculation."
+            )
+            st.markdown("- [Market Chameleon DRAM IV](https://marketchameleon.com/Overview/DRAM/IV/)")
+            st.markdown("- [Market Chameleon SOXX IV](https://marketchameleon.com/Overview/SOXX/IV/)")
+            st.markdown("- [Market Chameleon FXI IV](https://marketchameleon.com/Overview/FXI/IV/)")
+            st.markdown("- [Market Chameleon DRAM Dividends](https://marketchameleon.com/Overview/DRAM/Dividends/)")
+            st.markdown("- [Market Chameleon SOXX Dividends](https://marketchameleon.com/Overview/SOXX/Dividends/)")
+            st.markdown("- [Market Chameleon FXI Dividends](https://marketchameleon.com/Overview/FXI/Dividends/)")
 
-        st.subheader("Correlation matrix")
-        st.dataframe(corr.round(4), use_container_width=True)
-        st.dataframe(corr_long_df(corr).round(4), use_container_width=True, hide_index=True)
+            csv = underlying_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download underlying details CSV", csv, file_name="fcn_underlying_details.csv", mime="text/csv")
 
-        st.subheader("Schedule")
-        st.dataframe(
-            build_schedule(valuation_date, call_dates, coupon_dates, maturity_date),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.subheader("Model notes and references")
-        st.write(
-            "This pricer models the structured note as a financing leg plus a derivative leg, "
-            "with final coupon = funding_cost + option_value. "
-            "The payoff is worst-of: the minimum performance across the selected underlyings drives the call and maturity outcomes. "
-            "Dividend yield and implied volatility are market inputs, and correlation is material to the worst-of pricing."
-        )
-        st.markdown(
-            "- [The Interplay between Stochastic Volatility and Correlations in Equity Autocallables](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3228065)"
-        )
-        st.markdown(
-            "- [Pricing autocallables under local-stochastic volatility](https://www.aimsciences.org/article/doi/10.3934/fmf.2022008)"
-        )
-        st.markdown(
-            "- [A Bayesian view on autocallable pricing and risk management](https://sussex.figshare.com/articles/journal_contribution/A_Bayesian_view_on_autocallable_pricing_and_risk_management/23491451)"
-        )
-
-        csv = underlying_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download underlying details CSV", csv, file_name="fcn_underlying_details.csv", mime="text/csv")
-
-    except Exception as e:
-        st.error(str(e))
+        except Exception as e:
+            st.error(str(e))
