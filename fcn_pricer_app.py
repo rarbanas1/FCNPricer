@@ -294,17 +294,20 @@ def hist_corr(tickers):
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
     ret = np.log(df).diff().dropna()
     corr = ret.corr().reindex(index=tickers, columns=tickers).fillna(0.0).to_numpy()
+    corr = np.array(corr, dtype=float, copy=True)
     np.fill_diagonal(corr, 1.0)
     return pd.DataFrame(corr, index=tickers, columns=tickers)
 
 
 def cholesky_with_fallback(corr):
+    corr = np.array(corr, dtype=float, copy=True)
     try:
         return np.linalg.cholesky(corr)
     except Exception:
         eigvals, eigvecs = np.linalg.eigh(corr)
         eigvals = np.clip(eigvals, 1e-8, None)
         corr2 = eigvecs @ np.diag(eigvals) @ eigvecs.T
+        corr2 = np.array(corr2, dtype=float, copy=True)
         np.fill_diagonal(corr2, 1.0)
         return np.linalg.cholesky(corr2)
 
