@@ -506,7 +506,7 @@ def build_pdf_report(inputs, edited_df, corr_df, schedule_df, result):
     terms_data = [
         ["Valuation date", str(inputs["valuation_date"])],
         ["Maturity date", str(inputs["maturity_date"])],
-        ["Notional", f"{inputs['notional']:,.2f}"],
+        ["Notional", f"{inputs['notional']:,.0f}"],
         ["Funding cost (input)", f"{inputs['funding_cost']:.2%}"],
         ["Risk-free rate", f"{inputs['risk_free_rate']:.2%}"],
         ["Call barrier", f"{inputs['call_barrier']:.4f}"],
@@ -539,7 +539,7 @@ def build_pdf_report(inputs, edited_df, corr_df, schedule_df, result):
     elements += [t3, Spacer(1, 0.2 * inch), Paragraph("Valuation Results", styles["Heading2"])]
 
     res_rows = [
-        ["Note PV @ funding cost", f"{result['note_pv']:,.2f}"],
+        ["Note PV @ funding cost", f"{result['note_pv']:,.0f}"],
         ["Funding cost (input)", f"{result['funding_cost']:.2%}"],
         ["Option value (spread)", "N/A" if math.isnan(result['option_value']) else f"{result['option_value']:.2%}"],
         ["Fair coupon (solves to par)", "N/A" if math.isnan(result['coupon_rate']) else f"{result['coupon_rate']:.2%}"],
@@ -573,6 +573,29 @@ if "step" not in st.session_state:
 if "candidates" not in st.session_state:
     st.session_state.candidates = None
 
+# Global font-size bump. Streamlit's default text runs small on most
+# displays; this targets the stable data-testid hooks Streamlit exposes for
+# custom CSS (per their docs) rather than the auto-generated class names,
+# which change between Streamlit versions and would silently stop working.
+st.markdown(
+    """
+    <style>
+    html, body, .stMarkdown, .stMarkdown p, .stMarkdown li { font-size: 17px !important; }
+    h1 { font-size: 2.6rem !important; }
+    h2 { font-size: 1.9rem !important; }
+    h3 { font-size: 1.5rem !important; }
+    [data-testid="stWidgetLabel"] p { font-size: 1.05rem !important; font-weight: 600 !important; }
+    [data-testid="stMetricValue"] { font-size: 2.1rem !important; }
+    [data-testid="stMetricLabel"] { font-size: 1rem !important; }
+    [data-testid="stCaptionContainer"] { font-size: 0.98rem !important; }
+    .stButton button, .stDownloadButton button { font-size: 1.1rem !important; padding: 0.6rem 1rem !important; }
+    [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input,
+    [data-testid="stDateInput"] input { font-size: 1.05rem !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.header("Inputs and assumptions")
 
 with st.expander("How this works", expanded=False):
@@ -596,7 +619,7 @@ with c1:
         value=date.today() + timedelta(days=365),
         help="Defaults to 12 months from the valuation date.",
     )
-    notional = st.number_input("Notional", min_value=1.0, value=100000.0, step=1000.0)
+    notional = st.number_input("Notional", min_value=1, value=100000, step=1000, format="%d")
 with c2:
     funding_cost = st.number_input("Funding cost (annual)", min_value=0.0, value=0.035, step=0.005, format="%.4f",
                                      help="The issuer's own cost of funds -- the base rate before adding the value of the embedded option.")
@@ -773,7 +796,7 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
 
         st.subheader("Results")
         a, b, c, d = st.columns(4)
-        a.metric("Note PV @ funding cost", f"{result['note_pv']:,.2f}",
+        a.metric("Note PV @ funding cost", f"{result['note_pv']:,.0f}",
                   help="Discounted PV of the note's cash flows if the coupon is set at 'Funding cost'. Below notional means that coupon is not sufficient to price the note to par; can be negative relative to par.")
         b.metric("Funding cost (input)", f"{result['funding_cost']:.2%}")
         c.metric("Option value (spread)", "N/A" if np.isnan(result['option_value']) else f"{result['option_value']:.2%}",
