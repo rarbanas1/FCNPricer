@@ -1,3 +1,4 @@
+
 import math
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -16,6 +17,17 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
 st.caption("Worst-of FCN / autocallable pricer with multi-source market data review.")
+
+st.warning(
+    "**For personal research use only -- not investment, legal, or tax advice.** "
+    "This tool produces model-based estimates from a Monte Carlo simulation, using "
+    "third-party market data (Alpha Vantage, Finnhub, Yahoo Finance) that may be "
+    "delayed, incomplete, or inaccurate. Results are not a market-executable price, "
+    "and nothing shown here is an offer or solicitation to buy or sell any security "
+    "or structured product. Verify all inputs and outputs independently before "
+    "relying on them for any financial decision.",
+    icon="⚠️",
+)
 
 ALPHAV_URL = "https://www.alphavantage.co/query"
 FINNHUB_URL = "https://finnhub.io/api/v1"
@@ -786,12 +798,6 @@ if st.session_state.step >= 2 and st.session_state.candidates is not None:
                 n_paths=int(n_paths), seed=int(seed),
             )
 
-            # Stash everything in session_state rather than rendering directly here.
-            # Streamlit reruns the whole script on every widget interaction, and a
-            # plain `if st.button("Calculate")` block only stays True for the single
-            # rerun right after the click -- clicking the PDF download button below
-            # would otherwise trigger a rerun where Calculate reads False again and
-            # the entire Results section (download button included) disappears.
             st.session_state.last_result = result
             st.session_state.last_edited = inp
             st.session_state.last_corr = corr
