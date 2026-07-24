@@ -1,4 +1,3 @@
-
 import math
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -14,19 +13,52 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-# =========================
-# API KEYS: FILL THESE IN
-# =========================
-ALPHAVANTAGE_API_KEY = st.secrets["ALPHAVANTAGE_API_KEY"]
-FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
-# =========================
-
 st.set_page_config(page_title="FCN Pricer", layout="wide")
 st.title("FCN Pricer")
 st.caption("Worst-of FCN / autocallable pricer with multi-source market data review.")
 
 ALPHAV_URL = "https://www.alphavantage.co/query"
 FINNHUB_URL = "https://finnhub.io/api/v1"
+
+
+def _secret_or_blank(name: str) -> str:
+    """Read a key from st.secrets if a secrets.toml is configured; otherwise
+    return "" instead of raising, so the app still boots for anyone who
+    doesn't have (and shouldn't have) the owner's secrets file."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return ""
+
+
+# =========================
+# API KEYS
+# =========================
+# Keys are never hardcoded here and never leave this browser session --
+# they're read from st.secrets if present (so the owner's own deployment
+# keeps working with no extra steps), and otherwise left blank so anyone
+# else running this file locally or on their own deployment can paste in
+# their own free Alpha Vantage / Finnhub keys below. Nothing typed here is
+# stored, logged, or sent anywhere except directly to those two APIs.
+st.sidebar.header("API Keys")
+st.sidebar.caption(
+    "Used only for this session, never stored. Get free keys at "
+    "[alphavantage.co](https://www.alphavantage.co/support/#api-key) and "
+    "[finnhub.io](https://finnhub.io/register). yfinance (the third data "
+    "source) needs no key."
+)
+ALPHAVANTAGE_API_KEY = st.sidebar.text_input(
+    "Alpha Vantage API Key", value=_secret_or_blank("ALPHAVANTAGE_API_KEY"), type="password"
+)
+FINNHUB_API_KEY = st.sidebar.text_input(
+    "Finnhub API Key", value=_secret_or_blank("FINNHUB_API_KEY"), type="password"
+)
+if not ALPHAVANTAGE_API_KEY or not FINNHUB_API_KEY:
+    st.sidebar.warning(
+        "Missing key(s) above: Alpha Vantage and/or Finnhub sources will be skipped "
+        "(shown as unavailable). yfinance-based spot/vol/dividend fallbacks still work."
+    )
+# =========================
 
 
 def to_date(x):
